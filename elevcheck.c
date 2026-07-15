@@ -96,7 +96,7 @@ int main(void) {
 
     STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(STARTUPINFOEXA) }, .lpAttributeList = attrList };
     PROCESS_INFORMATION pi;
-    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT, NULL, NULL, &si.StartupInfo, &pi)) {
+    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_CONSOLE, NULL, NULL, &si.StartupInfo, &pi)) {
         printf("[-] CreateProcess failed (%lu)\n", GetLastError());
         DeleteProcThreadAttributeList(attrList);
         HeapFree(GetProcessHeap(), 0, attrList);

