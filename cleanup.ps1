@@ -1,10 +1,13 @@
-$dst = "C:\Program Files\Microsoft\svchost.exe"
+$svchost = "C:\Program Files\Microsoft\svchost.exe"
+$p0wershell = "C:\Windows\System32\P0wershell.exe"
 
 $body = @"
-`$dst = "$dst"
-Get-Process | Where-Object { `$_.Path -eq `$dst } | Stop-Process -Force -ErrorAction SilentlyContinue
-Remove-Item -Path `$dst -Force -ErrorAction SilentlyContinue
-Remove-Item -Path "$([System.IO.Path]::GetDirectoryName($dst))" -Force -ErrorAction SilentlyContinue
+`$svchost = "$svchost"
+`$p0wershell = "$p0wershell"
+Get-Process | Where-Object { `$_.Path -eq `$svchost -or `$_.Path -eq `$p0wershell } | Stop-Process -Force -ErrorAction SilentlyContinue
+Remove-Item -Path `$svchost -Force -ErrorAction SilentlyContinue
+Remove-Item -Path "C:\Program Files\Microsoft" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path `$p0wershell -Force -ErrorAction SilentlyContinue
 Remove-Item -Path `"`$PSCommandPath`" -Force -ErrorAction SilentlyContinue
 "@
 
@@ -15,6 +18,7 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit
 }
 
-Get-Process | Where-Object { $_.Path -eq $dst } | Stop-Process -Force -ErrorAction SilentlyContinue
-Remove-Item -Path $dst -Force -ErrorAction SilentlyContinue
+Get-Process | Where-Object { $_.Path -eq $svchost -or $_.Path -eq $p0wershell } | Stop-Process -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $svchost -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Program Files\Microsoft" -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $p0wershell -Force -ErrorAction SilentlyContinue
