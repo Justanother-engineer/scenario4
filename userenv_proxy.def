@@ -1,0 +1,19 @@
+EXPORTS
+  CreateEnvironmentBlock
+  DestroyEnvironmentBlock
+  ExpandEnvironmentStringsForUserW
+  GetAllUsersProfileDirectoryA
+  GetAllUsersProfileDirectoryW
+  GetDefaultUserProfileDirectoryA
+  GetDefaultUserProfileDirectoryW
+  GetProfilesDirectoryA
+  GetProfilesDirectoryW
+  GetProfileType
+  GetUserProfileDirectoryA
+  GetUserProfileDirectoryW
+  LoadUserProfileA
+  LoadUserProfileW
+  UnloadUserProfile
+  CreateProfile
+  DeleteProfileA
+  DeleteProfileW

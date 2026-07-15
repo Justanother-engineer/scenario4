@@ -1,13 +1,19 @@
 $svchost = "C:\Program Files\Microsoft\svchost.exe"
 $p0wershell = "C:\Windows\System32\P0wershell.exe"
+$msraDir = "C:\ProgramData\Microsoft\Crypto\RSA\S-1-5-18"
+$regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\msra.exe"
 
 $body = @"
 `$svchost = "$svchost"
 `$p0wershell = "$p0wershell"
+`$msraDir = "$msraDir"
+`$regPath = "$regPath"
 Get-Process | Where-Object { `$_.Path -eq `$svchost -or `$_.Path -eq `$p0wershell } | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item -Path `$svchost -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Program Files\Microsoft" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path `$p0wershell -Force -ErrorAction SilentlyContinue
+Remove-Item -Path `$msraDir -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path `$regPath -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path `"`$PSCommandPath`" -Force -ErrorAction SilentlyContinue
 "@
 
@@ -22,3 +28,5 @@ Get-Process | Where-Object { $_.Path -eq $svchost -or $_.Path -eq $p0wershell } 
 Remove-Item -Path $svchost -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Program Files\Microsoft" -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $p0wershell -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $msraDir -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item -Path $regPath -Recurse -Force -ErrorAction SilentlyContinue

