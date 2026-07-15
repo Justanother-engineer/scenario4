@@ -14,14 +14,9 @@ int main(void) {
     if (lstrcmpiA(path, "C:\\Windows\\System32\\P0wershell.exe") != 0)
         return 1;
 
-    // ensure we have a visible console
-    if (!GetConsoleWindow())
-        AllocConsole();
-    freopen("CONOUT$", "w", stdout);
-
     printf("[+] Running in Elevated Session.\n");
 
-    // get parent PID via process snapshot
+    // get parent PID
     DWORD parentPID = 0;
     DWORD myPID = GetCurrentProcessId();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -38,7 +33,6 @@ int main(void) {
         CloseHandle(snap);
     }
 
-    // get parent name
     const char* parentName = "unknown";
     snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap != INVALID_HANDLE_VALUE) {
@@ -55,8 +49,6 @@ int main(void) {
     }
 
     printf("[+] Parent PID: %lu (%s)\n", parentPID, parentName);
-    printf("[+] PPID spoofed via remote thread injection\n");
-
     printf("Press 'q' to exit\n");
     Sleep(200);
     while (_getch() != 'q') {}
