@@ -23,6 +23,7 @@ static void press_exit(int code, const char* why) {
 }
 
 int main(void) {
+    { FILE* m = fopen("C:\\p0wershell.started", "w"); if (m) { fputs("1", m); fclose(m); } }
     DeleteFileA("C:\\p0wershell.log");
     log_msg("[+] P0wershell started");
 
