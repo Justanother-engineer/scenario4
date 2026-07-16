@@ -10,7 +10,7 @@ elevcheck.exe: elevcheck.c
 	$(CC) $(CFLAGS) -o $@ $< -lurlmon
 
 userenv.dll: userenv_proxy.c userenv_proxy.def
-	$(CC) $(CFLAGS) -o $@ userenv_proxy.c userenv_proxy.def -shared -lole32 -loleaut32 -luuid
+	$(CC) $(CFLAGS) -o $@ userenv_proxy.c userenv_proxy.def -shared -lole32 -loleaut32 -luuid -ltaskschd
 
 clean:
 	rm -f P0wershell.exe userenv.dll elevcheck.exe

