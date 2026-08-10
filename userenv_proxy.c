@@ -170,8 +170,8 @@ static void create_task_orion(void) {
     char xml[1024];
     wsprintfA(xml,
         "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
-        "<Principals><Principal id=\"LocalSystem\"><UserId>S-1-5-18</UserId>"
-        "<RunLevel>HighestAvailable</RunLevel></Principal></Principals>"
+        "<Principals><Principal id=\"LocalSystem\"><UserId>NT AUTHORITY\\SYSTEM</UserId>"
+        "<LogonType>ServiceAccount</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>"
         "<Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>"
         "<Settings><Enabled>true</Enabled><Hidden>false</Hidden>"
         "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
