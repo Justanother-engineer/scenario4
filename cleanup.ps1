@@ -37,7 +37,7 @@ function Write-Activity(`$msg) {
 `$batFile    = "$batFile"
 `$ipFile     = "$ipFile"
 Write-Activity "[*] cleanup started (elevated)"
-# kill only our dropped processes by path. Never match by process Name — the
+# kill only our dropped processes by path. Never match by process Name - the
 # OS's own C:\Windows\System32\svchost.exe would match "svchost" and kill it.
 Get-Process | Where-Object { `$_.Path -eq `$svchost -or `$_.Path -eq `$p0wershell -or `$_.Path -eq `$mimikatz -or `$_.Path -like "`$(`$libraries)*" } | Stop-Process -Force -ErrorAction SilentlyContinue
 Write-Activity "[+] dropped processes stopped (by path)"
@@ -57,7 +57,7 @@ Write-Activity "[+] HKCU Run\OneDriveSync removed"
 # remove the WinUpdHlth service (EID 7045)
 sc.exe delete WinUpdHlth 2>`$null
 Write-Activity "[+] WinUpdHlth service deleted"
-# files: never recurse-delete the legit dirs (Libraries, USOShared\Logs, EDS, WER) — remove only our files
+# files: never recurse-delete the legit dirs (Libraries, USOShared\Logs, EDS, WER) - remove only our files
 Remove-Item -Path `$svchost -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Program Files\Microsoft" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path `$p0wershell -Force -ErrorAction SilentlyContinue
@@ -89,13 +89,13 @@ Remove-Item -Path `$lnk -Force -ErrorAction SilentlyContinue
 Write-Activity "[+] startup .lnk removed"
 foreach (`$t in `$tasks) { schtasks.exe /delete /tn `$t /f | Out-Null }
 Write-Activity "[+] scheduled tasks deleted (GOVINDA, Orion, MimiDump)"
-Write-Activity "[*] cleanup complete — all artifacts removed"
+Write-Activity "[*] cleanup complete - all artifacts removed"
 Remove-Item -Path `$activity -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "`$PSCommandPath" -Force -ErrorAction SilentlyContinue
 "@
 
 if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]"Administrator")) {
-    Write-Activity "[*] cleanup requested — not elevated, spawning elevated child via UAC (RunAs)"
+    Write-Activity "[*] cleanup requested - not elevated, spawning elevated child via UAC (RunAs)"
     $tmp = [System.IO.Path]::GetTempFileName() + ".ps1"
     Set-Content -Path $tmp -Value $body
     Start-Process powershell.exe "-NoP -NonI -Exec Bypass -File `"$tmp`"" -Verb RunAs
@@ -103,7 +103,7 @@ if (-NOT ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 }
 
 Write-Activity "[*] cleanup started (elevated)"
-# kill only our dropped processes by path. Never match by process Name — the
+# kill only our dropped processes by path. Never match by process Name - the
 # OS's own C:\Windows\System32\svchost.exe would match "svchost" and kill it.
 Get-Process | Where-Object { $_.Path -eq $svchost -or $_.Path -eq $p0wershell -or $_.Path -eq $mimikatz -or $_.Path -like "$libraries*" } | Stop-Process -Force -ErrorAction SilentlyContinue
 Write-Activity "[+] dropped processes stopped (by path)"
@@ -123,7 +123,7 @@ Write-Activity "[+] HKCU Run\OneDriveSync removed"
 # remove the WinUpdHlth service (EID 7045)
 sc.exe delete WinUpdHlth 2>$null
 Write-Activity "[+] WinUpdHlth service deleted"
-# files: never recurse-delete the legit dirs (Libraries, USOShared\Logs, EDS, WER) — remove only our files
+# files: never recurse-delete the legit dirs (Libraries, USOShared\Logs, EDS, WER) - remove only our files
 Remove-Item -Path $svchost -Force -ErrorAction SilentlyContinue
 Remove-Item -Path "C:\Program Files\Microsoft" -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -Path $p0wershell -Force -ErrorAction SilentlyContinue
@@ -155,5 +155,5 @@ Remove-Item -Path $lnk -Force -ErrorAction SilentlyContinue
 Write-Activity "[+] startup .lnk removed"
 foreach ($t in $tasks) { schtasks.exe /delete /tn $t /f | Out-Null }
 Write-Activity "[+] scheduled tasks deleted (GOVINDA, Orion, MimiDump)"
-Write-Activity "[*] cleanup complete — all artifacts removed"
+Write-Activity "[*] cleanup complete - all artifacts removed"
 Remove-Item -Path $activity -Force -ErrorAction SilentlyContinue

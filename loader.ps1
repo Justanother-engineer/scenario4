@@ -27,7 +27,7 @@ Add-Content -Path `$activity -Value ("[{0}] [loader.ps1] [+] elevcheck.exe launc
 
 if (-NOT $isAdmin) {
     $tmp = [System.IO.Path]::GetTempFileName() + ".ps1"
-    Write-Activity "[*] Elevation: IsUserAnAdmin=FALSE — spawning elevated child via UAC (RunAs), tmp=$tmp"
+    Write-Activity "[*] Elevation: IsUserAnAdmin=FALSE - spawning elevated child via UAC (RunAs), tmp=$tmp"
     Set-Content -Path $tmp -Value $body
     Start-Process powershell.exe "-NoP -NonI -Exec Bypass -File `"$tmp`"" -Verb RunAs
     exit
